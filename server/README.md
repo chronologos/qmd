@@ -1,85 +1,123 @@
 # QMD Remote LLM Server
 
-Reference server implementation for offloading QMD's GPU-intensive operations to a remote machine (e.g., NVIDIA DGX Spark).
+Server implementation for offloading QMD's GPU-intensive operations to a remote machine (e.g., NVIDIA DGX Spark), accessible via Tailscale.
 
 ## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                      DGX Spark                               │
-│                                                              │
-│  ┌──────────────────────┐    ┌──────────────────────────┐   │
-│  │  NVIDIA vLLM (8000)  │    │  Embed/Rerank API (8001) │   │
-│  │  /v1/completions     │    │  /v1/embeddings          │   │
-│  │  /v1/chat/completions│    │  /v1/rerank              │   │
-│  └──────────────────────┘    └──────────────────────────┘   │
-│                                                              │
-└─────────────────────────────────────────────────────────────┘
+│                      DGX Spark                              │
+│                                                             │
+│  ┌──────────────────────┐    ┌──────────────────────────┐  │
+│  │  NVIDIA vLLM (8000)  │    │  Embed/Rerank API (8001) │  │
+│  │  /v1/completions     │    │  /v1/embeddings          │  │
+│  │  /v1/chat/completions│    │  /v1/rerank              │  │
+│  └──────────────────────┘    └──────────────────────────┘  │
+│            │                            │                   │
+│            └──────────┬─────────────────┘                   │
+│                       │                                     │
+│              Tailscale Serve (HTTPS)                        │
+│                       │                                     │
+└───────────────────────┼─────────────────────────────────────┘
+                        │
+            ┌───────────┴───────────┐
+            │                       │
+    qmd-vllm.tailnet.ts.net  qmd-embed.tailnet.ts.net
 ```
 
 Two services:
 1. **NVIDIA vLLM** (port 8000) - Text generation for query expansion
 2. **Embed/Rerank API** (port 8001) - Embeddings and document reranking
 
-## Quick Start
+## DGX Spark Deployment
 
-### 1. Start the Embed/Rerank Server
+### Prerequisites
+
+1. Tailscale connected to your tailnet
+2. Docker with GPU support
+3. Python 3.12+ with uv
+
+### Step 1: Set Up Embed/Rerank Service
 
 ```bash
 cd server
 
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate
+# Create venv and install dependencies
+uv venv
+source .venv/bin/activate
+uv pip install -r requirements.txt
 
-# Install dependencies
-pip install -r requirements.txt
-
-# Run server
-uvicorn embed_rerank:app --host 0.0.0.0 --port 8001
+# Install PyTorch with CUDA support (required for DGX Spark)
+uv pip install --reinstall torch torchvision --index-url https://download.pytorch.org/whl/cu130
 ```
 
-### 2. Start vLLM for Text Generation
+### Step 2: Create Tailscale Services
 
-Using the official NVIDIA container:
+In the [Tailscale admin console](https://login.tailscale.com/admin/services):
+
+1. Create service `qmd-embed` with endpoint `tcp:443`
+2. Create service `qmd-vllm` with endpoint `tcp:443`
+
+### Step 3: Deploy Embed/Rerank Service
 
 ```bash
-# Pull the container
+# Deploy with systemd + Tailscale Serve
+sudo python3 deploy.py
+```
+
+This creates:
+- systemd service `qmd-embed.service`
+- Tailscale Serve config: `https://qmd-embed.<tailnet>.ts.net` → `localhost:8001`
+
+Management commands:
+```bash
+sudo python3 deploy.py --status   # Check status
+sudo python3 deploy.py --logs     # View logs
+sudo python3 deploy.py --restart  # Restart service
+sudo python3 deploy.py --stop     # Stop service
+```
+
+### Step 4: Deploy vLLM Service
+
+```bash
+# Pull the NVIDIA vLLM container (DGX Spark optimized)
 docker pull nvcr.io/nvidia/vllm:25.12.post1-py3
 
-# Run vLLM serving Qwen for query expansion
-docker run -d --gpus all -p 8000:8000 \
+# Start vLLM serving Qwen for query expansion
+docker run -d --gpus all \
+  -p 127.0.0.1:8000:8000 \
+  --restart unless-stopped \
   --name qmd-vllm \
   nvcr.io/nvidia/vllm:25.12.post1-py3 \
   vllm serve "Qwen/Qwen2.5-3B-Instruct"
+
+# Set up Tailscale Serve for vLLM
+sudo tailscale serve --service svc:qmd-vllm --bg --https=443 127.0.0.1:8000
 ```
 
-Or with sentence-transformers models (smaller, good for testing):
+### Step 5: Verify Services
 
 ```bash
-docker run -d --gpus all -p 8000:8000 \
-  --name qmd-vllm \
-  nvcr.io/nvidia/vllm:25.12.post1-py3 \
-  vllm serve "Qwen/Qwen2.5-1.5B-Instruct"
+# From another machine on the tailnet
+curl https://qmd-embed.<tailnet>.ts.net/health
+curl https://qmd-vllm.<tailnet>.ts.net/health
 ```
 
-### 3. Configure QMD
+### Step 6: Configure QMD Client
 
 Add to `~/.config/qmd/index.yml`:
 
 ```yaml
 remote:
-  generation_url: "http://dgx-spark:8000"  # vLLM
-  embed_url: "http://dgx-spark:8001"       # Embed/Rerank
-  # api_key: "${QMD_REMOTE_API_KEY}"       # Optional
+  generation_url: "https://qmd-vllm.<tailnet>.ts.net"
+  embed_url: "https://qmd-embed.<tailnet>.ts.net"
   models:
     embed: "nomic-embed"
     generate: "Qwen/Qwen2.5-3B-Instruct"
     rerank: "bge-reranker"
 ```
 
-### 4. Test Connection
-
+Test connection:
 ```bash
 qmd remote test
 ```
@@ -102,7 +140,7 @@ qmd remote test
 OpenAI-compatible embedding endpoint.
 
 ```bash
-curl -X POST http://localhost:8001/v1/embeddings \
+curl -X POST https://qmd-embed.<tailnet>.ts.net/v1/embeddings \
   -H "Content-Type: application/json" \
   -d '{
     "input": ["Hello world", "How are you?"],
@@ -126,7 +164,7 @@ Response:
 Rerank documents by relevance to a query.
 
 ```bash
-curl -X POST http://localhost:8001/v1/rerank \
+curl -X POST https://qmd-embed.<tailnet>.ts.net/v1/rerank \
   -H "Content-Type: application/json" \
   -d '{
     "query": "What is Python?",
@@ -155,7 +193,7 @@ Response:
 Health check endpoint.
 
 ```bash
-curl http://localhost:8001/health
+curl https://qmd-embed.<tailnet>.ts.net/health
 ```
 
 Response:
@@ -171,58 +209,6 @@ Response:
 }
 ```
 
-## Docker Deployment
-
-### Build Image
-
-```bash
-docker build -t qmd-embed-rerank server/
-```
-
-### Run Container
-
-```bash
-docker run -d --gpus all -p 8001:8001 \
-  --name qmd-embed-rerank \
-  -e EMBED_MODEL=nomic-ai/nomic-embed-text-v1.5 \
-  -e RERANK_MODEL=BAAI/bge-reranker-v2-m3 \
-  qmd-embed-rerank
-```
-
-### Docker Compose
-
-```yaml
-version: '3.8'
-services:
-  vllm:
-    image: nvcr.io/nvidia/vllm:25.12.post1-py3
-    command: vllm serve "Qwen/Qwen2.5-3B-Instruct"
-    ports:
-      - "8000:8000"
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-
-  embed-rerank:
-    build: ./server
-    ports:
-      - "8001:8001"
-    environment:
-      - EMBED_MODEL=nomic-ai/nomic-embed-text-v1.5
-      - RERANK_MODEL=BAAI/bge-reranker-v2-m3
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-```
-
 ## Model Recommendations
 
 | Task | Model | Size | Notes |
@@ -236,6 +222,22 @@ services:
 
 ## Troubleshooting
 
+### CUDA Not Available
+
+If `/health` shows `"cuda_available": false`, reinstall PyTorch with CUDA:
+
+```bash
+source .venv/bin/activate
+uv pip install --reinstall torch torchvision --index-url https://download.pytorch.org/whl/cu130
+sudo python3 deploy.py --restart
+```
+
+### Tailscale Service Not Reachable
+
+1. Verify service exists in admin console with endpoint `tcp:443`
+2. Restart tailscaled: `sudo systemctl restart tailscaled`
+3. Check serve config: `tailscale serve status --json`
+
 ### CUDA Out of Memory
 
 Reduce batch size or use smaller models:
@@ -246,18 +248,19 @@ export EMBED_MODEL=BAAI/bge-base-en-v1.5
 export RERANK_MODEL=BAAI/bge-reranker-base
 ```
 
-### Connection Refused
-
-Check that the server is running and accessible:
+### vLLM Container Issues
 
 ```bash
-# Test embed/rerank server
-curl http://localhost:8001/health
+# Check container logs
+docker logs qmd-vllm
 
-# Test vLLM server
-curl http://localhost:8000/health
+# Restart container
+docker restart qmd-vllm
+
+# Remove and recreate
+docker rm -f qmd-vllm
+docker run -d --gpus all -p 127.0.0.1:8000:8000 \
+  --restart unless-stopped --name qmd-vllm \
+  nvcr.io/nvidia/vllm:25.12.post1-py3 \
+  vllm serve "Qwen/Qwen2.5-3B-Instruct"
 ```
-
-### Slow First Request
-
-Models are loaded on first use. The `/health` endpoint triggers model loading at startup to warm up.
