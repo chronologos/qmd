@@ -19,6 +19,47 @@ import type {
   QueryType,
 } from "./llm.js";
 
+/**
+ * Parse and limit queryables from raw text output.
+ * Deduplicates by text content and limits to max 3 lex, 3 vec, 1 hyde.
+ * (Duplicated from llm.ts to avoid circular import)
+ */
+function parseQueryables(rawText: string, includeLexical: boolean): Queryable[] {
+  const lines = rawText.trim().split("\n");
+  const seen = new Set<string>();
+  const lex: Queryable[] = [];
+  const vec: Queryable[] = [];
+  const hyde: Queryable[] = [];
+
+  for (const line of lines) {
+    const colonIdx = line.indexOf(":");
+    if (colonIdx === -1) continue;
+
+    const type = line.slice(0, colonIdx).trim().toLowerCase();
+    if (type !== "lex" && type !== "vec" && type !== "hyde") continue;
+
+    const text = line.slice(colonIdx + 1).trim();
+    if (!text || seen.has(text)) continue;
+    seen.add(text);
+
+    const q: Queryable = { type: type as QueryType, text };
+
+    if (type === "lex" && lex.length < 3) {
+      lex.push(q);
+    } else if (type === "vec" && vec.length < 3) {
+      vec.push(q);
+    } else if (type === "hyde" && hyde.length < 1) {
+      hyde.push(q);
+    }
+  }
+
+  const result = [...lex, ...vec, ...hyde];
+  if (!includeLexical) {
+    return result.filter((q) => q.type !== "lex");
+  }
+  return result;
+}
+
 // =============================================================================
 // Configuration
 // =============================================================================
@@ -285,6 +326,7 @@ export class RemoteLLM implements LLM {
         model: this.models.generate,
         max_tokens: options?.maxTokens ?? 150,
         temperature: options?.temperature ?? 0,
+        stop: options?.stop,
       };
 
       const response = await this.fetchWithRetry<CompletionResponse>(
@@ -340,54 +382,26 @@ export class RemoteLLM implements LLM {
     const includeLexical = options?.includeLexical ?? true;
     const context = options?.context;
 
-    // Build the same prompt structure as LlamaCpp
-    const prompt = `You are a search query optimization expert. Your task is to improve retrieval by rewriting queries and generating hypothetical documents.
+    // Simpler prompt for remote - less chain-of-thought to reduce over-generation
+    const prompt = `Generate search queries for: "${query}"
+${context ? `\nContext: ${context}\n` : ""}
+Output format (one per line):
+${includeLexical ? "lex: keyword phrase\n" : ""}vec: semantic query
+hyde: A complete sentence that would appear in a relevant document.
 
-Original Query: ${query}
+Rules:
+- Output ONLY the formatted lines, no explanations
+- Maximum: ${includeLexical ? "2 lex, " : ""}2 vec, 1 hyde
+- Each line must be unique
+- Use plain text, no URL encoding
 
-${context ? `Additional Context, ONLY USE IF RELEVANT:\n\n<context>${context}</context>` : ""}
-
-## Step 1: Query Analysis
-Identify entities, search intent, and missing context.
-
-## Step 2: Generate Hypothetical Document
-Write a focused sentence passage that would answer the query. Include specific terminology and domain vocabulary.
-
-## Step 3: Query Rewrites
-Generate 2-3 alternative search queries that resolve ambiguities. Use terminology from the hypothetical document.
-
-## Step 4: Final Retrieval Text
-Output exactly 1-3 'lex' lines, 1-3 'vec' lines, and MAX ONE 'hyde' line.
-
-<format>
-lex: {single search term}
-vec: {single vector query}
-hyde: {complete hypothetical document passage from Step 2 on a SINGLE LINE}
-</format>
-
-<example>
-Example (FOR FORMAT ONLY - DO NOT COPY THIS CONTENT):
-lex: example keyword 1
-lex: example keyword 2
-vec: example semantic query
-hyde: This is an example of a hypothetical document passage that would answer the example query. It contains multiple sentences and relevant vocabulary.
-</example>
-
-<rules>
-- DO NOT repeat the same line.
-- Each 'lex:' line MUST be a different keyword variation based on the ORIGINAL QUERY.
-- Each 'vec:' line MUST be a different semantic variation based on the ORIGINAL QUERY.
-- The 'hyde:' line MUST be the full sentence passage from Step 2, but all on one line.
-- DO NOT use the example content above.
-${!includeLexical ? "- Do NOT output any 'lex:' lines" : ""}
-</rules>
-
-Final Output:`;
+Output:`;
 
     try {
       const result = await this.generate(prompt, {
-        maxTokens: 1000,
-        temperature: 1,
+        maxTokens: 300,  // Reduced from 1000
+        temperature: 0.7,  // Reduced from 1.0 for more focused output
+        stop: ["\n\n", "---", "Rules:", "Note:"],  // Stop on double newline or common continuation patterns
       });
 
       if (!result?.text) {
@@ -397,24 +411,8 @@ Final Output:`;
         return fallback;
       }
 
-      // Parse the response
-      const lines = result.text.trim().split("\n");
-      const queryables: Queryable[] = lines
-        .map((line) => {
-          const colonIdx = line.indexOf(":");
-          if (colonIdx === -1) return null;
-          const type = line.slice(0, colonIdx).trim();
-          if (type !== "lex" && type !== "vec" && type !== "hyde") return null;
-          const text = line.slice(colonIdx + 1).trim();
-          return { type: type as QueryType, text };
-        })
-        .filter((q): q is Queryable => q !== null);
-
-      // Filter out lex entries if not requested
-      if (!includeLexical) {
-        return queryables.filter((q) => q.type !== "lex");
-      }
-      return queryables;
+      // Use shared parser with deduplication and limits
+      return parseQueryables(result.text, includeLexical);
     } catch (error) {
       console.error("Remote query expansion failed:", error);
       // Fallback to original query

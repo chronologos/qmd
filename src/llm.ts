@@ -113,6 +113,7 @@ export type GenerateOptions = {
   model?: string;
   maxTokens?: number;
   temperature?: number;
+  stop?: string[];
 };
 
 /**
@@ -143,6 +144,52 @@ export type RerankDocument = {
   text: string;
   title?: string;
 };
+
+/**
+ * Parse and limit queryables from raw text output.
+ * Deduplicates by text content and limits to max 3 lex, 3 vec, 1 hyde.
+ */
+export function parseQueryables(
+  rawText: string,
+  includeLexical: boolean
+): Queryable[] {
+  const lines = rawText.trim().split("\n");
+  const seen = new Set<string>();
+  const lex: Queryable[] = [];
+  const vec: Queryable[] = [];
+  const hyde: Queryable[] = [];
+
+  for (const line of lines) {
+    const colonIdx = line.indexOf(":");
+    if (colonIdx === -1) continue;
+
+    const type = line.slice(0, colonIdx).trim().toLowerCase();
+    if (type !== "lex" && type !== "vec" && type !== "hyde") continue;
+
+    const text = line.slice(colonIdx + 1).trim();
+    if (!text || seen.has(text)) continue;
+    seen.add(text);
+
+    const q: Queryable = { type: type as QueryType, text };
+
+    if (type === "lex" && lex.length < 3) {
+      lex.push(q);
+    } else if (type === "vec" && vec.length < 3) {
+      vec.push(q);
+    } else if (type === "hyde" && hyde.length < 1) {
+      hyde.push(q);
+    }
+  }
+
+  // Combine in order: lex, vec, hyde
+  const result = [...lex, ...vec, ...hyde];
+
+  // Filter out lex if not requested
+  if (!includeLexical) {
+    return result.filter((q) => q.type !== "lex");
+  }
+  return result;
+}
 
 // =============================================================================
 // Model Configuration
@@ -709,21 +756,8 @@ Final Output:`;
         temperature: 1,
       });
 
-      const lines = result.trim().split("\n");
-      const queryables: Queryable[] = lines.map(line => {
-        const colonIdx = line.indexOf(":");
-        if (colonIdx === -1) return null;
-        const type = line.slice(0, colonIdx).trim();
-        if (type !== 'lex' && type !== 'vec' && type !== 'hyde') return null;
-        const text = line.slice(colonIdx + 1).trim();
-        return { type: type as QueryType, text };
-      }).filter((q): q is Queryable => q !== null);
-
-      // Filter out lex entries if not requested
-      if (!includeLexical) {
-        return queryables.filter(q => q.type !== 'lex');
-      }
-      return queryables;
+      // Use shared parser with deduplication and limits
+      return parseQueryables(result, includeLexical);
     } catch (error) {
       console.error("Structured query expansion failed:", error);
       // Fallback to original query
