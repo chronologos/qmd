@@ -43,7 +43,15 @@ EMBED_MODEL = os.environ.get("EMBED_MODEL", "Qwen/Qwen3-Embedding-4B")
 RERANK_MODEL = os.environ.get("RERANK_MODEL", "Qwen/Qwen3-Reranker-4B")
 DEVICE = os.environ.get("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
 MAX_BATCH_SIZE = int(os.environ.get("MAX_BATCH_SIZE", "64"))
-USE_FLASH_ATTN = os.environ.get("USE_FLASH_ATTN", "true").lower() == "true"
+# Check if flash_attn is actually available (CUDA version must match)
+_flash_attn_available = False
+if os.environ.get("USE_FLASH_ATTN", "true").lower() == "true":
+    try:
+        import flash_attn  # noqa: F401
+        _flash_attn_available = True
+    except ImportError:
+        pass
+USE_FLASH_ATTN = _flash_attn_available
 
 # =============================================================================
 # Request/Response Models
@@ -128,11 +136,11 @@ class Models:
                 # Qwen3 benefits from flash attention and left padding
                 if USE_FLASH_ATTN:
                     model_kwargs["attn_implementation"] = "flash_attention_2"
-                model_kwargs["device_map"] = "auto"
                 tokenizer_kwargs["padding_side"] = "left"
 
                 cls.embed_model = SentenceTransformer(
                     EMBED_MODEL,
+                    device=DEVICE,
                     model_kwargs=model_kwargs,
                     tokenizer_kwargs=tokenizer_kwargs,
                     trust_remote_code=True,
@@ -157,17 +165,19 @@ class Models:
                 # Qwen3 reranker uses CausalLM with yes/no token scoring
                 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+                logger.info(f"Loading tokenizer for {RERANK_MODEL}...")
                 cls.rerank_tokenizer = AutoTokenizer.from_pretrained(
                     RERANK_MODEL,
                     padding_side="left",
                     trust_remote_code=True,
                 )
+                logger.info(f"Tokenizer loaded, loading model weights...")
                 cls.rerank_model = AutoModelForCausalLM.from_pretrained(
                     RERANK_MODEL,
                     torch_dtype=torch.float16,
-                    device_map="auto",
                     trust_remote_code=True,
-                ).eval()
+                ).to(DEVICE).eval()
+                logger.info(f"Model loaded to {DEVICE}")
 
                 # Cache token IDs for yes/no
                 cls.token_true_id = cls.rerank_tokenizer.convert_tokens_to_ids("yes")

@@ -214,6 +214,17 @@ sudo python3 deploy.py --restart  # Restart service
 
 Service URL: `https://qmd-embed.<tailnet>.ts.net`
 
+#### DGX Spark Deployment Notes
+
+**GPU Memory**: When running both vLLM and embed/rerank on the same GPU, limit vLLM's memory:
+```bash
+docker run ... vllm serve "Qwen/Qwen3-8B" --gpu-memory-utilization 0.3
+```
+
+**Flash Attention**: The DGX Spark GB10 uses CUDA 13, but flash-attn wheels are built for CUDA 12. Set `USE_FLASH_ATTN=false` or the code will auto-detect and disable if flash_attn import fails.
+
+**Model Loading**: Avoid `device_map="auto"` with sentence-transformers - it causes meta tensor errors. Use explicit `device="cuda"` instead.
+
 ## Important: Do NOT run automatically
 
 - Never run `qmd collection add`, `qmd embed`, or `qmd update` automatically
