@@ -617,6 +617,13 @@ You can also access documents directly via the \`qmd://\` URI scheme:
   const transport = new StdioServerTransport();
   await server.connect(transport);
 
+  // Keep the process alive by waiting for stdin to close
+  // Bun exits if there are no active handles, so we need to explicitly wait
+  await new Promise<void>((resolve) => {
+    process.stdin.on('close', resolve);
+    process.stdin.on('end', resolve);
+  });
+
   // Note: Database stays open - it will be closed when the process exits
 }
 
