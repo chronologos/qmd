@@ -183,9 +183,36 @@ qmd embed --remote-url http://other:8000  # Override URL
 
 ### Server Setup
 
-See `server/README.md` for deployment instructions. Two services:
+See `server/README.md` for full details. Two services:
 - **vLLM** (port 8000): Text generation for query expansion
 - **Embed/Rerank API** (port 8001): FastAPI server using sentence-transformers
+
+#### Deploying Embed/Rerank as a Tailscale Service
+
+The embed/rerank server can be deployed as a Tailscale service for secure access:
+
+```bash
+cd server
+
+# Create venv and install dependencies (use CUDA PyTorch for GPU)
+uv venv
+uv pip install -r requirements.txt
+uv pip install --reinstall torch --index-url https://download.pytorch.org/whl/cu130
+
+# Prerequisites: Create Tailscale Service "qmd-embed" in admin console
+# https://login.tailscale.com/admin/services
+# Set endpoint to tcp:443
+
+# Deploy (creates systemd service + tailscale serve)
+sudo python3 deploy.py
+
+# Management commands
+sudo python3 deploy.py --status   # Check service status
+sudo python3 deploy.py --logs     # View logs
+sudo python3 deploy.py --restart  # Restart service
+```
+
+Service URL: `https://qmd-embed.<tailnet>.ts.net`
 
 ## Important: Do NOT run automatically
 
