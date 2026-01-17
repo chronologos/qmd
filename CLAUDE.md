@@ -128,6 +128,65 @@ bun link               # Install globally as 'qmd'
 - Reciprocal Rank Fusion (RRF) for combining results
 - Token-based chunking: 800 tokens/chunk with 15% overlap
 
+## Remote LLM Support
+
+GPU-intensive operations can be offloaded to a remote server (e.g., NVIDIA DGX Spark):
+
+```
+┌─────────────┐     ┌─────────────────────────────────────┐
+│   qmd CLI   │     │           LLM Interface             │
+└──────┬──────┘     │  embed() | rerank() | expandQuery() │
+       │            └──────────────┬──────────────────────┘
+       │                           │
+       │            ┌──────────────┴──────────────┐
+       │            │                             │
+       ▼            ▼                             ▼
+┌─────────────┐  ┌─────────────┐          ┌─────────────┐
+│  LlamaCpp   │  │  RemoteLLM  │  ──HTTP──▶│  DGX Spark  │
+│  (local)    │  │  (remote)   │          │  Server     │
+└─────────────┘  └─────────────┘          └─────────────┘
+```
+
+### Configuration
+
+Add to `~/.config/qmd/index.yml`:
+
+```yaml
+remote:
+  generation_url: "http://dgx-spark:8000"  # vLLM for query expansion
+  embed_url: "http://dgx-spark:8001"       # Embed/rerank service
+  api_key: "${QMD_REMOTE_API_KEY}"         # Optional, supports env vars
+  models:
+    embed: nomic-embed
+    generate: Qwen/Qwen2.5-3B-Instruct
+    rerank: bge-reranker
+```
+
+### CLI Flags
+
+```sh
+qmd remote test           # Test connection to remote server
+qmd remote status         # Show remote configuration
+
+# Override at runtime
+qmd embed --remote        # Force remote backend
+qmd query "test" --local  # Force local backend
+qmd embed --remote-url http://other:8000  # Override URL
+```
+
+### Provider Selection Priority
+
+1. `--local` flag → always local
+2. `--remote` or `--remote-url` flag → remote
+3. Config file `remote:` section → remote
+4. Default → local
+
+### Server Setup
+
+See `server/README.md` for deployment instructions. Two services:
+- **vLLM** (port 8000): Text generation for query expansion
+- **Embed/Rerank API** (port 8001): FastAPI server using sentence-transformers
+
 ## Important: Do NOT run automatically
 
 - Never run `qmd collection add`, `qmd embed`, or `qmd update` automatically
