@@ -1556,8 +1556,8 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
   const startTime = Date.now();
 
   // Batch embedding for better throughput
-  // Process in batches of 32 to balance memory usage and efficiency
-  const BATCH_SIZE = 32;
+  // Process in batches of 64 to balance memory usage and efficiency
+  const BATCH_SIZE = 64;
 
   for (let batchStart = 0; batchStart < allChunks.length; batchStart += BATCH_SIZE) {
     const batchEnd = Math.min(batchStart + BATCH_SIZE, allChunks.length);

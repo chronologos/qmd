@@ -104,6 +104,7 @@ User={sudo_user}
 Group={sudo_user}
 WorkingDirectory={DEPLOY_DIR}
 Environment="PATH={VENV_DIR}/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="MAX_BATCH_SIZE=64"
 
 # Start uvicorn
 ExecStart={VENV_DIR}/bin/uvicorn embed_rerank:app --host 127.0.0.1 --port {LOCAL_PORT}

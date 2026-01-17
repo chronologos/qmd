@@ -221,6 +221,8 @@ Service URL: `https://qmd-embed.<tailnet>.ts.net`
 docker run ... vllm serve "Qwen/Qwen3-8B" --gpu-memory-utilization 0.3
 ```
 
+**Batch Size**: The embed service defaults to `MAX_BATCH_SIZE=64` for better throughput with large models like Qwen3-Embedding-4B.
+
 **Flash Attention**: The DGX Spark GB10 uses CUDA 13, but flash-attn wheels are built for CUDA 12. Set `USE_FLASH_ATTN=false` or the code will auto-detect and disable if flash_attn import fails.
 
 **Model Loading**: Avoid `device_map="auto"` with sentence-transformers - it causes meta tensor errors. Use explicit `device="cuda"` instead.
