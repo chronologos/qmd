@@ -4,5 +4,9 @@
       "Bash(bun run tsc:*)",
       "Skill(jj-vcs)"
     ]
-  }
+  },
+  "enabledMcpjsonServers": [
+    "anki"
+  ],
+  "enableAllProjectMcpServers": true
 }

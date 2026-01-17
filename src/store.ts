@@ -334,9 +334,11 @@ function initializeDatabase(db: Database): void {
       pos INTEGER NOT NULL DEFAULT 0,
       model TEXT NOT NULL,
       embedded_at TEXT NOT NULL,
+      hash_seq TEXT GENERATED ALWAYS AS (hash || '_' || seq) STORED,
       PRIMARY KEY (hash, seq)
     )
   `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_content_vectors_hash_seq ON content_vectors(hash_seq)`);
 
   // FTS - index filepath (collection/path), title, and content
   db.exec(`
@@ -1678,7 +1680,6 @@ export async function searchVec(db: Database, query: string, model: string, limi
 
   const embedding = await getEmbedding(query, model, true);
   if (!embedding) return [];
-
   // sqlite-vec requires "k = ?" for KNN queries
   let sql = `
     SELECT
@@ -1691,7 +1692,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
       cv.hash,
       cv.pos
     FROM vectors_vec v
-    JOIN content_vectors cv ON cv.hash || '_' || cv.seq = v.hash_seq
+    JOIN content_vectors cv ON cv.hash_seq = v.hash_seq
     JOIN documents d ON d.hash = cv.hash AND d.active = 1
     JOIN content ON content.hash = d.hash
     WHERE v.embedding MATCH ? AND k = ?
