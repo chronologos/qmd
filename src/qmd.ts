@@ -272,7 +272,7 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
 }
 
-function showStatus(): void {
+function showStatus(format: OutputFormat = "cli"): void {
   const dbPath = getDbPath();
   const db = getDb();
 
@@ -296,6 +296,28 @@ function showStatus(): void {
 
   // Most recent update across all collections
   const mostRecent = db.prepare(`SELECT MAX(modified_at) as latest FROM documents WHERE active = 1`).get() as { latest: string | null };
+
+  // JSON output
+  if (format === "json") {
+    const jsonOutput = {
+      totalDocuments: totalDocs.count,
+      needsEmbedding,
+      hasVectorIndex: vectorCount.count > 0,
+      indexSize,
+      indexPath: dbPath,
+      lastUpdated: mostRecent.latest,
+      collections: collections.map(col => ({
+        name: col.name,
+        path: col.base_path,
+        pattern: col.glob_pattern,
+        documents: col.active_count,
+        lastUpdated: col.last_modified || "",
+      })),
+    };
+    console.log(JSON.stringify(jsonOutput, null, 2));
+    closeDb();
+    return;
+  }
 
   console.log(`${c.bold}QMD Status${c.reset}\n`);
   console.log(`Index: ${dbPath}`);
@@ -679,7 +701,7 @@ function contextCheck(): void {
   closeDb();
 }
 
-function getDocument(filename: string, fromLine?: number, maxLines?: number, lineNumbers?: boolean): void {
+function getDocument(filename: string, fromLine?: number, maxLines?: number, lineNumbers?: boolean, format: OutputFormat = "cli"): void {
   const db = getDb();
 
   // Parse :linenum suffix from filename (e.g., "file.md:100")
@@ -839,11 +861,22 @@ function getDocument(filename: string, fromLine?: number, maxLines?: number, lin
     output = addLineNumbers(output, startLine);
   }
 
-  // Output context header if exists
-  if (context) {
-    console.log(`Folder Context: ${context}\n---\n`);
+  // Output based on format
+  if (format === "json") {
+    const jsonOutput = {
+      file: virtualPath,
+      title: doc.path.split('/').pop()?.replace(/\.md$/, '') || doc.path,
+      ...(context && { context }),
+      body: output,
+    };
+    console.log(JSON.stringify(jsonOutput, null, 2));
+  } else {
+    // Output context header if exists
+    if (context) {
+      console.log(`Folder Context: ${context}\n---\n`);
+    }
+    console.log(output);
   }
-  console.log(output);
   closeDb();
 }
 
@@ -1533,7 +1566,9 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
   if (multiChunkDocs > 0) {
     console.log(`${c.dim}${multiChunkDocs} documents split into multiple chunks${c.reset}`);
   }
-  console.log(`${c.dim}Model: ${model}${c.reset}\n`);
+  // Show actual model being used (remote or local)
+  const modelDisplay = isRemoteLLM() ? `${getRemoteConfig()?.models?.embed || 'remote'} (remote)` : model;
+  console.log(`${c.dim}Model: ${modelDisplay}${c.reset}\n`);
 
   // Hide cursor during embedding
   cursor.hide();
@@ -2672,12 +2707,12 @@ if (import.meta.main) {
 
     case "get": {
       if (!cli.args[0]) {
-        console.error("Usage: qmd get <filepath>[:line] [--from <line>] [-l <lines>] [--line-numbers]");
+        console.error("Usage: qmd get <filepath>[:line] [--from <line>] [-l <lines>] [--line-numbers] [--json]");
         process.exit(1);
       }
       const fromLine = cli.values.from ? parseInt(cli.values.from as string, 10) : undefined;
       const maxLines = cli.values.l ? parseInt(cli.values.l as string, 10) : undefined;
-      getDocument(cli.args[0], fromLine, maxLines, cli.opts.lineNumbers);
+      getDocument(cli.args[0], fromLine, maxLines, cli.opts.lineNumbers, cli.opts.format);
       break;
     }
 
@@ -2747,7 +2782,7 @@ if (import.meta.main) {
     }
 
     case "status":
-      showStatus();
+      showStatus(cli.opts.format);
       break;
 
     case "update":
@@ -2787,7 +2822,8 @@ if (import.meta.main) {
       break;
 
     case "mcp": {
-      const { startMcpServer } = await import("./mcp.js");
+      // Use shell-based MCP server to avoid code duplication with CLI
+      const { startMcpServer } = await import("./mcp-shell.js");
       await startMcpServer();
       break;
     }
