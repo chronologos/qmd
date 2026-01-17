@@ -157,9 +157,9 @@ remote:
   embed_url: "http://dgx-spark:8001"       # Embed/rerank service
   api_key: "${QMD_REMOTE_API_KEY}"         # Optional, supports env vars
   models:
-    embed: nomic-embed
-    generate: Qwen/Qwen2.5-3B-Instruct
-    rerank: bge-reranker
+    embed: Qwen/Qwen3-Embedding-4B
+    generate: Qwen/Qwen3-8B
+    rerank: Qwen/Qwen3-Reranker-4B
 ```
 
 ### CLI Flags

@@ -3,6 +3,11 @@
  *
  * Offloads GPU-intensive operations (embedding, reranking, query expansion)
  * to a remote server via OpenAI-compatible HTTP APIs.
+ *
+ * Default models (Qwen3 stack for DGX Spark):
+ * - Embedding: Qwen/Qwen3-Embedding-4B
+ * - Reranking: Qwen/Qwen3-Reranker-4B
+ * - Generation: Qwen/Qwen3-8B
  */
 
 import type {
@@ -165,11 +170,11 @@ export class RemoteLLM implements LLM {
     // Expand environment variables in API key
     this.apiKey = config.apiKey ? this.expandEnvVars(config.apiKey) : undefined;
 
-    // Default model names
+    // Default model names (Qwen3 stack)
     this.models = {
-      embed: config.models?.embed || "nomic-embed",
-      generate: config.models?.generate || "Qwen/Qwen2.5-3B-Instruct",
-      rerank: config.models?.rerank || "bge-reranker",
+      embed: config.models?.embed || "Qwen/Qwen3-Embedding-4B",
+      generate: config.models?.generate || "Qwen/Qwen3-8B",
+      rerank: config.models?.rerank || "Qwen/Qwen3-Reranker-4B",
     };
 
     this.timeout = config.timeout ?? DEFAULT_TIMEOUT;
