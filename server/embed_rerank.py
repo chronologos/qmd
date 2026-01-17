@@ -14,10 +14,11 @@ Usage:
   uvicorn embed_rerank:app --host 0.0.0.0 --port 8001
 
 Environment variables:
-  EMBED_MODEL    - HuggingFace model for embeddings (default: nomic-ai/nomic-embed-text-v1.5)
-  RERANK_MODEL   - HuggingFace model for reranking (default: BAAI/bge-reranker-v2-m3)
+  EMBED_MODEL    - HuggingFace model for embeddings (default: Qwen/Qwen3-Embedding-4B)
+  RERANK_MODEL   - HuggingFace model for reranking (default: Qwen/Qwen3-Reranker-4B)
   DEVICE         - Device to use: cuda, cpu, mps (default: cuda)
   MAX_BATCH_SIZE - Maximum batch size for embeddings (default: 64)
+  USE_FLASH_ATTN - Enable flash attention 2 (default: true)
 """
 
 import os
@@ -38,10 +39,11 @@ logger = logging.getLogger(__name__)
 # Configuration
 # =============================================================================
 
-EMBED_MODEL = os.environ.get("EMBED_MODEL", "nomic-ai/nomic-embed-text-v1.5")
-RERANK_MODEL = os.environ.get("RERANK_MODEL", "BAAI/bge-reranker-v2-m3")
+EMBED_MODEL = os.environ.get("EMBED_MODEL", "Qwen/Qwen3-Embedding-4B")
+RERANK_MODEL = os.environ.get("RERANK_MODEL", "Qwen/Qwen3-Reranker-4B")
 DEVICE = os.environ.get("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
 MAX_BATCH_SIZE = int(os.environ.get("MAX_BATCH_SIZE", "64"))
+USE_FLASH_ATTN = os.environ.get("USE_FLASH_ATTN", "true").lower() == "true"
 
 # =============================================================================
 # Request/Response Models
@@ -99,10 +101,17 @@ class HealthResponse(BaseModel):
 # Model Management
 # =============================================================================
 
+# Check if we're using Qwen3 reranker (requires different loading approach)
+IS_QWEN3_RERANKER = "qwen3-reranker" in RERANK_MODEL.lower()
+
 class Models:
     """Lazy-loaded model container"""
     embed_model = None
     rerank_model = None
+    rerank_tokenizer = None
+    # Token IDs for Qwen3 reranker yes/no scoring
+    token_true_id = None
+    token_false_id = None
 
     @classmethod
     def get_embed_model(cls):
@@ -110,11 +119,31 @@ class Models:
             logger.info(f"Loading embedding model: {EMBED_MODEL}")
             start = time.time()
             from sentence_transformers import SentenceTransformer
-            cls.embed_model = SentenceTransformer(
-                EMBED_MODEL,
-                device=DEVICE,
-                trust_remote_code=True,  # Required for nomic models
-            )
+
+            # Configure model kwargs for Qwen3 or other models
+            model_kwargs = {"trust_remote_code": True}
+            tokenizer_kwargs = {}
+
+            if "qwen3" in EMBED_MODEL.lower():
+                # Qwen3 benefits from flash attention and left padding
+                if USE_FLASH_ATTN:
+                    model_kwargs["attn_implementation"] = "flash_attention_2"
+                model_kwargs["device_map"] = "auto"
+                tokenizer_kwargs["padding_side"] = "left"
+
+                cls.embed_model = SentenceTransformer(
+                    EMBED_MODEL,
+                    model_kwargs=model_kwargs,
+                    tokenizer_kwargs=tokenizer_kwargs,
+                    trust_remote_code=True,
+                )
+            else:
+                # Legacy loading for non-Qwen3 models
+                cls.embed_model = SentenceTransformer(
+                    EMBED_MODEL,
+                    device=DEVICE,
+                    trust_remote_code=True,
+                )
             logger.info(f"Embedding model loaded in {time.time() - start:.2f}s")
         return cls.embed_model
 
@@ -123,14 +152,45 @@ class Models:
         if cls.rerank_model is None:
             logger.info(f"Loading rerank model: {RERANK_MODEL}")
             start = time.time()
-            from sentence_transformers import CrossEncoder
-            cls.rerank_model = CrossEncoder(
-                RERANK_MODEL,
-                device=DEVICE,
-                trust_remote_code=True,
-            )
+
+            if IS_QWEN3_RERANKER:
+                # Qwen3 reranker uses CausalLM with yes/no token scoring
+                from transformers import AutoModelForCausalLM, AutoTokenizer
+
+                cls.rerank_tokenizer = AutoTokenizer.from_pretrained(
+                    RERANK_MODEL,
+                    padding_side="left",
+                    trust_remote_code=True,
+                )
+                cls.rerank_model = AutoModelForCausalLM.from_pretrained(
+                    RERANK_MODEL,
+                    torch_dtype=torch.float16,
+                    device_map="auto",
+                    trust_remote_code=True,
+                ).eval()
+
+                # Cache token IDs for yes/no
+                cls.token_true_id = cls.rerank_tokenizer.convert_tokens_to_ids("yes")
+                cls.token_false_id = cls.rerank_tokenizer.convert_tokens_to_ids("no")
+                logger.info(f"Qwen3 reranker token IDs: yes={cls.token_true_id}, no={cls.token_false_id}")
+            else:
+                # CrossEncoder for traditional rerankers (bge, etc.)
+                from sentence_transformers import CrossEncoder
+                cls.rerank_model = CrossEncoder(
+                    RERANK_MODEL,
+                    device=DEVICE,
+                    trust_remote_code=True,
+                )
+
             logger.info(f"Rerank model loaded in {time.time() - start:.2f}s")
         return cls.rerank_model
+
+    @classmethod
+    def get_rerank_tokenizer(cls):
+        """Get tokenizer for Qwen3 reranker"""
+        if cls.rerank_tokenizer is None:
+            cls.get_rerank_model()  # This loads both model and tokenizer
+        return cls.rerank_tokenizer
 
 
 # =============================================================================
@@ -225,6 +285,51 @@ async def embeddings(request: EmbeddingRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _format_qwen3_rerank_input(query: str, document: str, instruction: str | None = None) -> str:
+    """Format input for Qwen3 reranker with conversation template."""
+    if instruction is None:
+        instruction = "Given a web search query, retrieve relevant passages that answer the query"
+
+    prefix = '<|im_start|>system\nJudge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be "yes" or "no".<|im_end|>\n<|im_start|>user\n'
+    suffix = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+
+    return f"{prefix}<Instruct>: {instruction}\n<Query>: {query}\n<Document>: {document}{suffix}"
+
+
+@torch.no_grad()
+def _qwen3_rerank_score(query: str, documents: list[str], instruction: str | None = None) -> list[float]:
+    """Score documents using Qwen3 reranker's yes/no token probabilities."""
+    model = Models.get_rerank_model()
+    tokenizer = Models.get_rerank_tokenizer()
+
+    # Format all inputs
+    inputs_text = [_format_qwen3_rerank_input(query, doc, instruction) for doc in documents]
+
+    # Tokenize
+    inputs = tokenizer(
+        inputs_text,
+        padding=True,
+        truncation=True,
+        return_tensors="pt",
+        max_length=8192,
+    ).to(model.device)
+
+    # Get logits for the last token position
+    outputs = model(**inputs)
+    logits = outputs.logits[:, -1, :]
+
+    # Extract yes/no probabilities
+    true_logits = logits[:, Models.token_true_id]
+    false_logits = logits[:, Models.token_false_id]
+
+    # Compute P(yes) / (P(yes) + P(no)) via log_softmax
+    stacked = torch.stack([false_logits, true_logits], dim=1)
+    log_probs = torch.nn.functional.log_softmax(stacked, dim=1)
+    scores = log_probs[:, 1].exp().tolist()
+
+    return scores
+
+
 @app.post("/v1/rerank", response_model=RerankResponse)
 async def rerank(request: RerankRequest):
     """
@@ -233,19 +338,21 @@ async def rerank(request: RerankRequest):
     Returns documents sorted by relevance score (highest first).
     """
     try:
-        model = Models.get_rerank_model()
-
         if len(request.documents) == 0:
             raise HTTPException(status_code=400, detail="Documents cannot be empty")
 
-        # Build query-document pairs
-        pairs = [[request.query, doc] for doc in request.documents]
-
-        # Score all pairs
         start = time.time()
-        scores = model.predict(pairs, show_progress_bar=False)
-        elapsed = time.time() - start
 
+        if IS_QWEN3_RERANKER:
+            # Use Qwen3's yes/no token scoring
+            scores = _qwen3_rerank_score(request.query, request.documents)
+        else:
+            # Traditional CrossEncoder scoring
+            model = Models.get_rerank_model()
+            pairs = [[request.query, doc] for doc in request.documents]
+            scores = model.predict(pairs, show_progress_bar=False)
+
+        elapsed = time.time() - start
         logger.info(f"Reranked {len(request.documents)} documents in {elapsed:.3f}s")
 
         # Build results sorted by score (descending)
