@@ -63,7 +63,8 @@ import {
   createStore,
   getDefaultDbPath,
 } from "./store.js";
-import { getDefaultLlamaCpp, disposeDefaultLlamaCpp, type RerankDocument, type Queryable, type QueryType } from "./llm.js";
+import { getDefaultLlamaCpp, disposeDefaultLlamaCpp, setDefaultLLMConfig, isRemoteLLM, type RerankDocument, type Queryable, type QueryType } from "./llm.js";
+import type { RemoteLLMConfig } from "./llm-remote.js";
 import type { SearchResult, RankedResult } from "./store.js";
 import {
   formatSearchResults,
@@ -79,6 +80,9 @@ import {
   removeContext as yamlRemoveContext,
   setGlobalContext,
   listAllContexts,
+  getRemoteConfig,
+  hasRemoteConfig,
+  type RemoteConfig,
 } from "./collections.js";
 
 // Enable production mode - allows using default database path
@@ -2247,6 +2251,171 @@ async function querySearch(query: string, opts: OutputOptions, embedModel: strin
   outputResults(dedupedResults, query, opts);
 }
 
+// =============================================================================
+// Remote LLM Provider Configuration
+// =============================================================================
+
+/**
+ * Initialize LLM provider based on CLI flags and config.
+ * Priority: --local > --remote/--remote-url > config file > local default
+ */
+function initializeLLMProvider(values: Record<string, unknown>): void {
+  const forceLocal = !!values.local;
+  const forceRemote = !!values.remote || !!values["remote-url"];
+  const remoteUrlOverride = values["remote-url"] as string | undefined;
+
+  // --local flag always wins
+  if (forceLocal) {
+    setDefaultLLMConfig({ provider: 'local' });
+    return;
+  }
+
+  // --remote or --remote-url flags
+  if (forceRemote) {
+    const configFromYaml = getRemoteConfig();
+    const remoteConfig: RemoteLLMConfig = {
+      url: remoteUrlOverride || configFromYaml?.url,
+      embedUrl: configFromYaml?.embed_url,
+      generationUrl: configFromYaml?.generation_url,
+      apiKey: configFromYaml?.api_key,
+      models: configFromYaml?.models,
+      timeout: configFromYaml?.timeout,
+      retries: configFromYaml?.retries,
+    };
+    setDefaultLLMConfig({ provider: 'remote', remoteConfig });
+    return;
+  }
+
+  // Check config file for remote configuration
+  if (hasRemoteConfig()) {
+    const configFromYaml = getRemoteConfig()!;
+    const remoteConfig: RemoteLLMConfig = {
+      url: configFromYaml.url,
+      embedUrl: configFromYaml.embed_url,
+      generationUrl: configFromYaml.generation_url,
+      apiKey: configFromYaml.api_key,
+      models: configFromYaml.models,
+      timeout: configFromYaml.timeout,
+      retries: configFromYaml.retries,
+    };
+    setDefaultLLMConfig({ provider: 'remote', remoteConfig });
+    return;
+  }
+
+  // Default to local
+  setDefaultLLMConfig({ provider: 'local' });
+}
+
+/**
+ * Test connection to remote LLM server
+ */
+async function remoteTest(): Promise<void> {
+  if (!hasRemoteConfig()) {
+    console.error("No remote LLM configured in ~/.config/qmd/index.yml");
+    console.error("");
+    console.error("Add a 'remote' section to your config:");
+    console.error("");
+    console.error("  remote:");
+    console.error("    url: http://your-server:8000");
+    console.error("    # Or split URLs:");
+    console.error("    # embed_url: http://your-server:8001");
+    console.error("    # generation_url: http://your-server:8000");
+    process.exit(1);
+  }
+
+  const configFromYaml = getRemoteConfig()!;
+  const { RemoteLLM } = await import("./llm-remote.js");
+  const remote = new RemoteLLM({
+    url: configFromYaml.url,
+    embedUrl: configFromYaml.embed_url,
+    generationUrl: configFromYaml.generation_url,
+    apiKey: configFromYaml.api_key,
+    models: configFromYaml.models,
+    timeout: configFromYaml.timeout,
+    retries: configFromYaml.retries,
+  });
+
+  console.log(`${c.bold}Testing remote LLM connection...${c.reset}\n`);
+
+  const result = await remote.testConnection();
+
+  // Display embed service status
+  const embedUrl = configFromYaml.embed_url || configFromYaml.url || "(not configured)";
+  if (result.embedService.ok) {
+    console.log(`${c.green}✓${c.reset} Embed/Rerank service: ${embedUrl}`);
+  } else {
+    console.log(`${c.yellow}✗${c.reset} Embed/Rerank service: ${embedUrl}`);
+    console.log(`  ${c.dim}Error: ${result.embedService.error}${c.reset}`);
+  }
+
+  // Display generation service status
+  const genUrl = configFromYaml.generation_url || configFromYaml.url || "(not configured)";
+  if (result.generationService.ok) {
+    console.log(`${c.green}✓${c.reset} Generation service: ${genUrl}`);
+  } else {
+    console.log(`${c.yellow}✗${c.reset} Generation service: ${genUrl}`);
+    console.log(`  ${c.dim}Error: ${result.generationService.error}${c.reset}`);
+  }
+
+  // Overall status
+  console.log("");
+  if (result.embedService.ok && result.generationService.ok) {
+    console.log(`${c.green}All services healthy!${c.reset}`);
+  } else if (result.embedService.ok || result.generationService.ok) {
+    console.log(`${c.yellow}Some services unavailable${c.reset}`);
+  } else {
+    console.log(`${c.yellow}Remote services unreachable${c.reset}`);
+    process.exit(1);
+  }
+}
+
+/**
+ * Show remote LLM configuration and status
+ */
+async function remoteStatus(): Promise<void> {
+  console.log(`${c.bold}Remote LLM Configuration${c.reset}\n`);
+
+  if (!hasRemoteConfig()) {
+    console.log(`${c.dim}No remote LLM configured.${c.reset}`);
+    console.log("");
+    console.log("To configure, add to ~/.config/qmd/index.yml:");
+    console.log("");
+    console.log("  remote:");
+    console.log("    url: http://your-server:8000");
+    console.log("    api_key: ${QMD_REMOTE_API_KEY}  # Optional");
+    console.log("    models:");
+    console.log("      embed: nomic-embed");
+    console.log("      generate: Qwen/Qwen2.5-3B-Instruct");
+    console.log("      rerank: bge-reranker");
+    return;
+  }
+
+  const config = getRemoteConfig()!;
+
+  console.log(`URL:            ${config.url || "(not set)"}`);
+  if (config.embed_url) {
+    console.log(`Embed URL:      ${config.embed_url}`);
+  }
+  if (config.generation_url) {
+    console.log(`Generation URL: ${config.generation_url}`);
+  }
+  console.log(`API Key:        ${config.api_key ? "(configured)" : "(not set)"}`);
+  console.log(`Timeout:        ${config.timeout || 30000}ms`);
+  console.log(`Retries:        ${config.retries || 3}`);
+  console.log("");
+
+  if (config.models) {
+    console.log(`${c.bold}Models${c.reset}`);
+    console.log(`  Embed:    ${config.models.embed || "(default)"}`);
+    console.log(`  Generate: ${config.models.generate || "(default)"}`);
+    console.log(`  Rerank:   ${config.models.rerank || "(default)"}`);
+  }
+}
+
+// =============================================================================
+// CLI Argument Parsing
+// =============================================================================
+
 // Parse CLI arguments using util.parseArgs
 function parseCLI() {
   const { values, positionals } = parseArgs({
@@ -2283,6 +2452,10 @@ function parseCLI() {
       from: { type: "string" },  // start line
       "max-bytes": { type: "string" },  // max bytes for multi-get
       "line-numbers": { type: "boolean" },  // add line numbers to output
+      // Remote LLM options
+      remote: { type: "boolean" },  // Use remote LLM backend
+      "remote-url": { type: "string" },  // Override remote URL
+      local: { type: "boolean" },  // Force local LLM (even if remote configured)
     },
     allowPositionals: true,
     strict: false, // Allow unknown options to pass through
@@ -2346,9 +2519,14 @@ function showHelp(): void {
   console.log("  qmd vsearch <query>           - Vector similarity search");
   console.log("  qmd query <query>             - Combined search with query expansion + reranking");
   console.log("  qmd mcp                       - Start MCP server (for AI agent integration)");
+  console.log("  qmd remote test               - Test connection to remote LLM server");
+  console.log("  qmd remote status             - Show remote LLM configuration");
   console.log("");
   console.log("Global options:");
   console.log("  --index <name>             - Use custom index name (default: index)");
+  console.log("  --remote                   - Use remote LLM backend");
+  console.log("  --remote-url <url>         - Override remote URL");
+  console.log("  --local                    - Force local LLM (even if remote configured)");
   console.log("");
   console.log("Search options:");
   console.log("  -n <num>                   - Number of results (default: 5, or 20 for --files)");
@@ -2385,7 +2563,30 @@ if (import.meta.main) {
     process.exit(cli.values.help ? 0 : 1);
   }
 
+  // Initialize LLM provider based on CLI flags and config
+  initializeLLMProvider(cli.values);
+
   switch (cli.command) {
+    case "remote": {
+      const subcommand = cli.args[0];
+      switch (subcommand) {
+        case "test":
+          await remoteTest();
+          break;
+        case "status":
+          await remoteStatus();
+          break;
+        default:
+          console.error("Usage: qmd remote <test|status>");
+          console.error("");
+          console.error("Commands:");
+          console.error("  qmd remote test    - Test connection to remote LLM server");
+          console.error("  qmd remote status  - Show remote LLM configuration");
+          process.exit(1);
+      }
+      break;
+    }
+
     case "context": {
       const subcommand = cli.args[0];
       if (!subcommand) {

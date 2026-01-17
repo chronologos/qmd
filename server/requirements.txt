@@ -1,0 +1,14 @@
+# QMD Remote LLM Server Dependencies
+
+# Web framework
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+pydantic>=2.0.0
+
+# ML models
+torch>=2.0.0
+sentence-transformers>=3.0.0
+transformers>=4.36.0
+
+# Optional: for better performance
+einops  # Required by some models

@@ -18,6 +18,9 @@ import { homedir } from "os";
 import { join } from "path";
 import { existsSync, mkdirSync } from "fs";
 
+// Import remote LLM (lazy to avoid circular deps - loaded on demand)
+import type { RemoteLLMConfig } from "./llm-remote.js";
+
 // =============================================================================
 // Embedding Formatting Functions
 // =============================================================================
@@ -169,6 +172,11 @@ export interface LLM {
   embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null>;
 
   /**
+   * Batch embed multiple texts efficiently
+   */
+  embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]>;
+
+  /**
    * Generate text completion
    */
   generate(prompt: string, options?: GenerateOptions): Promise<GenerateResult | null>;
@@ -189,6 +197,17 @@ export interface LLM {
    * Returns list of documents with relevance scores (higher = more relevant)
    */
   rerank(query: string, documents: RerankDocument[], options?: RerankOptions): Promise<RerankResult>;
+
+  /**
+   * Tokenize text into tokens (for chunking)
+   * Returns an array of opaque token objects
+   */
+  tokenize(text: string): Promise<readonly unknown[]>;
+
+  /**
+   * Detokenize tokens back to text
+   */
+  detokenize(tokens: readonly unknown[]): Promise<string>;
 
   /**
    * Dispose of resources
@@ -789,36 +808,95 @@ Final Output:`;
 }
 
 // =============================================================================
-// Singleton for default LlamaCpp instance
+// LLM Provider Types and Factory
 // =============================================================================
 
-let defaultLlamaCpp: LlamaCpp | null = null;
+export type LLMProvider = 'local' | 'remote';
 
 /**
- * Get the default LlamaCpp instance (creates one if needed)
+ * Configuration for the default LLM instance.
+ * Set via setDefaultLLMConfig() before first access.
  */
-export function getDefaultLlamaCpp(): LlamaCpp {
-  if (!defaultLlamaCpp) {
-    defaultLlamaCpp = new LlamaCpp();
+let defaultLLMConfig: { provider: LLMProvider; remoteConfig?: RemoteLLMConfig } | null = null;
+
+/**
+ * Configure the default LLM provider and settings.
+ * Must be called before getDefaultLlamaCpp() if you want to use remote.
+ */
+export function setDefaultLLMConfig(config: { provider: LLMProvider; remoteConfig?: RemoteLLMConfig }): void {
+  defaultLLMConfig = config;
+  // Reset the singleton so the next call uses the new config
+  if (defaultLLM) {
+    defaultLLM.dispose().catch(() => {});
+    defaultLLM = null;
   }
-  return defaultLlamaCpp;
 }
 
 /**
- * Set a custom default LlamaCpp instance (useful for testing)
+ * Get the current LLM configuration
  */
-export function setDefaultLlamaCpp(llm: LlamaCpp | null): void {
-  defaultLlamaCpp = llm;
+export function getDefaultLLMConfig(): { provider: LLMProvider; remoteConfig?: RemoteLLMConfig } | null {
+  return defaultLLMConfig;
 }
 
 /**
- * Dispose the default LlamaCpp instance if it exists.
+ * Create an LLM instance for the specified provider
+ */
+export async function createLLM(provider: LLMProvider, config?: RemoteLLMConfig | LlamaCppConfig): Promise<LLM> {
+  if (provider === 'remote') {
+    // Dynamically import to avoid loading node-llama-cpp when using remote
+    const { RemoteLLM } = await import("./llm-remote.js");
+    return new RemoteLLM(config as RemoteLLMConfig || {});
+  }
+  return new LlamaCpp(config as LlamaCppConfig);
+}
+
+// =============================================================================
+// Singleton for default LLM instance
+// =============================================================================
+
+let defaultLLM: LLM | null = null;
+
+/**
+ * Get the default LLM instance (creates one if needed).
+ * Uses the configuration set via setDefaultLLMConfig(), or local by default.
+ */
+export function getDefaultLlamaCpp(): LLM {
+  if (!defaultLLM) {
+    if (defaultLLMConfig?.provider === 'remote' && defaultLLMConfig.remoteConfig) {
+      // Synchronously create RemoteLLM - import is already resolved if config was set
+      // We use require-style dynamic import here for sync access
+      const { RemoteLLM } = require("./llm-remote.js");
+      defaultLLM = new RemoteLLM(defaultLLMConfig.remoteConfig);
+    } else {
+      defaultLLM = new LlamaCpp();
+    }
+  }
+  return defaultLLM;
+}
+
+/**
+ * Set a custom default LLM instance (useful for testing)
+ */
+export function setDefaultLlamaCpp(llm: LLM | null): void {
+  defaultLLM = llm;
+}
+
+/**
+ * Dispose the default LLM instance if it exists.
  * Call this before process exit to prevent NAPI crashes.
  */
 export async function disposeDefaultLlamaCpp(): Promise<void> {
-  if (defaultLlamaCpp) {
-    await defaultLlamaCpp.dispose();
-    defaultLlamaCpp = null;
+  if (defaultLLM) {
+    await defaultLLM.dispose();
+    defaultLLM = null;
   }
+}
+
+/**
+ * Check if the current LLM provider is remote
+ */
+export function isRemoteLLM(): boolean {
+  return defaultLLMConfig?.provider === 'remote';
 }
 

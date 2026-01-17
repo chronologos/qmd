@@ -32,11 +32,36 @@ export interface Collection {
 }
 
 /**
+ * Remote LLM configuration for offloading GPU operations
+ */
+export interface RemoteConfig {
+  /** Single URL for all services (fallback if specific URLs not set) */
+  url?: string;
+  /** URL for embed + rerank service */
+  embed_url?: string;
+  /** URL for vLLM generation service */
+  generation_url?: string;
+  /** Optional Bearer token for authentication (supports ${ENV_VAR} expansion) */
+  api_key?: string;
+  /** Model names for each operation */
+  models?: {
+    embed?: string;
+    generate?: string;
+    rerank?: string;
+  };
+  /** Request timeout in milliseconds (default: 30000) */
+  timeout?: number;
+  /** Retry count for transient failures (default: 3) */
+  retries?: number;
+}
+
+/**
  * The complete configuration file structure
  */
 export interface CollectionConfig {
   global_context?: string;                    // Context applied to all collections
   collections: Record<string, Collection>;    // Collection name -> config
+  remote?: RemoteConfig;                      // Remote LLM configuration
 }
 
 /**
@@ -376,4 +401,38 @@ export function configExists(): boolean {
 export function isValidCollectionName(name: string): boolean {
   // Allow alphanumeric, hyphens, underscores
   return /^[a-zA-Z0-9_-]+$/.test(name);
+}
+
+// ============================================================================
+// Remote LLM configuration
+// ============================================================================
+
+/**
+ * Get remote LLM configuration from index.yml
+ * Returns undefined if not configured
+ */
+export function getRemoteConfig(): RemoteConfig | undefined {
+  const config = loadConfig();
+  return config.remote;
+}
+
+/**
+ * Set remote LLM configuration
+ */
+export function setRemoteConfig(remote: RemoteConfig | undefined): void {
+  const config = loadConfig();
+  if (remote) {
+    config.remote = remote;
+  } else {
+    delete config.remote;
+  }
+  saveConfig(config);
+}
+
+/**
+ * Check if remote LLM is configured
+ */
+export function hasRemoteConfig(): boolean {
+  const config = loadConfig();
+  return !!(config.remote?.url || config.remote?.embed_url || config.remote?.generation_url);
 }
