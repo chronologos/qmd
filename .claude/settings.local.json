@@ -3,7 +3,8 @@
     "allow": [
       "Bash(bun run tsc:*)",
       "Skill(jj-vcs)",
-      "Bash(bun test:*)"
+      "Bash(bun test:*)",
+      "Bash(QMD_TEST_REMOTE=1 bun test:*)"
     ]
   },
   "enableAllProjectMcpServers": true,

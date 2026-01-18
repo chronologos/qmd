@@ -10,60 +10,19 @@
  * - Generation: Qwen/Qwen3-8B
  */
 
-import type {
-  LLM,
-  EmbedOptions,
-  EmbeddingResult,
-  GenerateOptions,
-  GenerateResult,
-  ModelInfo,
-  RerankOptions,
-  RerankResult,
-  RerankDocument,
-  Queryable,
-  QueryType,
-} from "./llm.js";
-
-/**
- * Parse and limit queryables from raw text output.
- * Deduplicates by text content and limits to max 3 lex, 3 vec, 1 hyde.
- * (Duplicated from llm.ts to avoid circular import)
- */
-function parseQueryables(rawText: string, includeLexical: boolean): Queryable[] {
-  const lines = rawText.trim().split("\n");
-  const seen = new Set<string>();
-  const lex: Queryable[] = [];
-  const vec: Queryable[] = [];
-  const hyde: Queryable[] = [];
-
-  for (const line of lines) {
-    const colonIdx = line.indexOf(":");
-    if (colonIdx === -1) continue;
-
-    const type = line.slice(0, colonIdx).trim().toLowerCase();
-    if (type !== "lex" && type !== "vec" && type !== "hyde") continue;
-
-    const text = line.slice(colonIdx + 1).trim();
-    if (!text || seen.has(text)) continue;
-    seen.add(text);
-
-    const q: Queryable = { type: type as QueryType, text };
-
-    if (type === "lex" && lex.length < 3) {
-      lex.push(q);
-    } else if (type === "vec" && vec.length < 3) {
-      vec.push(q);
-    } else if (type === "hyde" && hyde.length < 1) {
-      hyde.push(q);
-    }
-  }
-
-  const result = [...lex, ...vec, ...hyde];
-  if (!includeLexical) {
-    return result.filter((q) => q.type !== "lex");
-  }
-  return result;
-}
+import {
+  parseQueryables,
+  type LLM,
+  type EmbedOptions,
+  type EmbeddingResult,
+  type GenerateOptions,
+  type GenerateResult,
+  type ModelInfo,
+  type RerankOptions,
+  type RerankResult,
+  type RerankDocument,
+  type Queryable,
+} from "./llm-types.js";
 
 // =============================================================================
 // Configuration
