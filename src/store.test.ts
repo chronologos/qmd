@@ -12,7 +12,7 @@ import { unlink, mkdtemp, rmdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import YAML from "yaml";
-import { disposeDefaultLlamaCpp } from "./llm.js";
+import { setupTestLLM, cleanupTestLLM, shouldSkipLLMTests, getTestEmbedModel, getTestEmbedDimensions } from "./test-config.js";
 import {
   createStore,
   getDefaultDbPath,
@@ -220,7 +220,7 @@ beforeAll(async () => {
 
 afterAll(async () => {
   // Ensure native resources are released to avoid ggml-metal asserts on process exit.
-  await disposeDefaultLlamaCpp();
+  await cleanupTestLLM();
 
   try {
     // Clean up test directory
@@ -451,6 +451,8 @@ describe("Store Creation", () => {
     try {
       await unlink(testDbPath);
     } catch {}
+    // Clean up test config directory - must reset QMD_CONFIG_DIR
+    delete process.env.QMD_CONFIG_DIR;
   });
 });
 
@@ -601,7 +603,12 @@ describe("Document Chunking", () => {
 });
 
 describe("Token-based Chunking", () => {
+  beforeAll(async () => {
+    await setupTestLLM();
+  });
+
   test("chunkDocumentByTokens returns single chunk for small documents", async () => {
+    if (shouldSkipLLMTests()) return;
     const content = "This is a small document.";
     const chunks = await chunkDocumentByTokens(content, 800, 120);
     expect(chunks).toHaveLength(1);
@@ -612,6 +619,7 @@ describe("Token-based Chunking", () => {
   });
 
   test("chunkDocumentByTokens splits large documents", async () => {
+    if (shouldSkipLLMTests()) return;
     // Create a document that's definitely more than 800 tokens
     const content = "The quick brown fox jumps over the lazy dog. ".repeat(200);
     const chunks = await chunkDocumentByTokens(content, 800, 120);
@@ -634,6 +642,7 @@ describe("Token-based Chunking", () => {
   });
 
   test("chunkDocumentByTokens creates overlapping chunks", async () => {
+    if (shouldSkipLLMTests()) return;
     const content = "Word ".repeat(500);  // ~500 tokens
     const chunks = await chunkDocumentByTokens(content, 200, 30);  // 15% overlap
 
@@ -649,6 +658,7 @@ describe("Token-based Chunking", () => {
   });
 
   test("chunkDocumentByTokens returns actual token counts", async () => {
+    if (shouldSkipLLMTests()) return;
     const content = "Hello world, this is a test.";
     const chunks = await chunkDocumentByTokens(content);
 
@@ -1771,7 +1781,12 @@ describe("Integration", () => {
 // =============================================================================
 
 describe("LlamaCpp Integration", () => {
+  beforeAll(async () => {
+    await setupTestLLM();
+  });
+
   test("searchVec returns empty when no vector index", async () => {
+    if (shouldSkipLLMTests()) return;
     const store = await createTestStore();
     const collectionName = await createTestCollection();
     await insertTestDocument(store.db, collectionName, {
@@ -1780,13 +1795,14 @@ describe("LlamaCpp Integration", () => {
     });
 
     // No vectors_vec table exists, should return empty
-    const results = await store.searchVec("query", "embeddinggemma", 10);
+    const results = await store.searchVec("query", getTestEmbedModel(), 10);
     expect(results).toHaveLength(0);
 
     await cleanupTestDb(store);
   });
 
   test("searchVec returns results when vector index exists", async () => {
+    if (shouldSkipLLMTests()) return;
     const store = await createTestStore();
     const collectionName = await createTestCollection();
 
@@ -1800,12 +1816,13 @@ describe("LlamaCpp Integration", () => {
     });
 
     // Create vector table and insert a vector
-    store.ensureVecTable(768);
-    const embedding = Array(768).fill(0).map(() => Math.random());
+    const dim = getTestEmbedDimensions();
+    store.ensureVecTable(dim);
+    const embedding = Array(dim).fill(0).map(() => Math.random());
     store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'test', ?)`).run(hash, new Date().toISOString());
     store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${hash}_0`, new Float32Array(embedding));
 
-    const results = await store.searchVec("test query", "embeddinggemma", 10);
+    const results = await store.searchVec("test query", getTestEmbedModel(), 10);
     expect(results).toHaveLength(1);
     expect(results[0]!.displayPath).toBe(`${collectionName}/doc1.md`);
     expect(results[0]!.filepath).toBe(`qmd://${collectionName}/doc1.md`);
@@ -1815,6 +1832,7 @@ describe("LlamaCpp Integration", () => {
   });
 
   test("searchVec filters by collection name", async () => {
+    if (shouldSkipLLMTests()) return;
     const store = await createTestStore();
     const collection1 = await createTestCollection({ name: "coll1", pwd: "/test/coll1" });
     const collection2 = await createTestCollection({ name: "coll2", pwd: "/test/coll2" });
@@ -1834,21 +1852,22 @@ describe("LlamaCpp Integration", () => {
       body: "Content in collection two",
     });
 
-    // Create vectors_vec table with correct dimensions (768 for embeddinggemma)
-    store.ensureVecTable(768);
-    const embedding1 = Array(768).fill(0).map(() => Math.random());
-    const embedding2 = Array(768).fill(0).map(() => Math.random());
+    // Create vectors_vec table with correct dimensions
+    const dim = getTestEmbedDimensions();
+    store.ensureVecTable(dim);
+    const embedding1 = Array(dim).fill(0).map(() => Math.random());
+    const embedding2 = Array(dim).fill(0).map(() => Math.random());
     store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'test', ?)`).run(hash1, new Date().toISOString());
     store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'test', ?)`).run(hash2, new Date().toISOString());
     store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${hash1}_0`, new Float32Array(embedding1));
     store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${hash2}_0`, new Float32Array(embedding2));
 
     // Search without filter - should return both
-    const allResults = await store.searchVec("content", "embeddinggemma", 10);
+    const allResults = await store.searchVec("content", getTestEmbedModel(), 10);
     expect(allResults).toHaveLength(2);
 
     // Search with collection filter - should return only from collection1
-    const filtered = await store.searchVec("content", "embeddinggemma", 10, collection1 as unknown as number);
+    const filtered = await store.searchVec("content", getTestEmbedModel(), 10, collection1 as unknown as number);
     expect(filtered).toHaveLength(1);
     expect(filtered[0]!.collectionName).toBe(collection1);
 
@@ -1856,6 +1875,7 @@ describe("LlamaCpp Integration", () => {
   });
 
   test("expandQuery returns original plus expanded queries", async () => {
+    if (shouldSkipLLMTests()) return;
     const store = await createTestStore();
 
     const queries = await store.expandQuery("test query");
@@ -1868,6 +1888,7 @@ describe("LlamaCpp Integration", () => {
   }, 30000);
 
   test("expandQuery caches results", async () => {
+    if (shouldSkipLLMTests()) return;
     const store = await createTestStore();
 
     // First call
@@ -1881,6 +1902,7 @@ describe("LlamaCpp Integration", () => {
   }, 30000);
 
   test("rerank scores documents", async () => {
+    if (shouldSkipLLMTests()) return;
     const store = await createTestStore();
 
     const docs = [
@@ -1897,6 +1919,7 @@ describe("LlamaCpp Integration", () => {
   });
 
   test("rerank caches results", async () => {
+    if (shouldSkipLLMTests()) return;
     const store = await createTestStore();
 
     const docs = [{ file: "doc1.md", text: "Content for caching test" }];

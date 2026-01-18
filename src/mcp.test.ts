@@ -10,7 +10,15 @@ import { Database } from "bun:sqlite";
 import * as sqliteVec from "sqlite-vec";
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { getDefaultLlamaCpp, disposeDefaultLlamaCpp } from "./llm";
+import { getDefaultLlamaCpp } from "./llm";
+import {
+  setupTestLLM,
+  cleanupTestLLM,
+  getTestEmbedModel,
+  getTestEmbedDimensions,
+  getTestLLMDescription,
+  shouldSkipLLMTests,
+} from "./test-config";
 import { mkdtemp, writeFile, readdir, unlink, rmdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -27,7 +35,7 @@ let testConfigDir: string;
 
 afterAll(async () => {
   // Ensure native resources are released to avoid ggml-metal asserts on process exit.
-  await disposeDefaultLlamaCpp();
+  await cleanupTestLLM();
 });
 
 function initTestDatabase(db: Database): void {
@@ -78,9 +86,11 @@ function initTestDatabase(db: Database): void {
       pos INTEGER NOT NULL DEFAULT 0,
       model TEXT NOT NULL,
       embedded_at TEXT NOT NULL,
+      hash_seq TEXT GENERATED ALWAYS AS (hash || '_' || seq) STORED,
       PRIMARY KEY (hash, seq)
     )
   `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_content_vectors_hash_seq ON content_vectors(hash_seq)`);
 
   db.exec(`
     CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
@@ -100,8 +110,9 @@ function initTestDatabase(db: Database): void {
     END
   `);
 
-  // Create vector table
-  db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS vectors_vec USING vec0(hash_seq TEXT PRIMARY KEY, embedding float[768] distance_metric=cosine)`);
+  // Create vector table with dimensions matching the test LLM backend
+  const dim = getTestEmbedDimensions();
+  db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS vectors_vec USING vec0(hash_seq TEXT PRIMARY KEY, embedding float[${dim}] distance_metric=cosine)`);
 }
 
 function seedTestData(db: Database): void {
@@ -158,12 +169,14 @@ function seedTestData(db: Database): void {
     `).run(doc.path, doc.title, doc.hash, now, now);
   }
 
-  // Add embeddings for vector search
-  const embedding = new Float32Array(768);
-  for (let i = 0; i < 768; i++) embedding[i] = Math.random();
+  // Add embeddings for vector search with dimensions matching the test LLM backend
+  const dim = getTestEmbedDimensions();
+  const model = getTestEmbedModel();
+  const embedding = new Float32Array(dim);
+  for (let i = 0; i < dim; i++) embedding[i] = Math.random();
 
   for (const doc of docs.slice(0, 4)) { // Skip large file for embeddings
-    db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'embeddinggemma', ?)`).run(doc.hash, now);
+    db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, ?, ?)`).run(doc.hash, model, now);
     db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${doc.hash}_0`, embedding);
   }
 }
@@ -187,7 +200,6 @@ import {
   getDocumentBody,
   findDocuments,
   getStatus,
-  DEFAULT_EMBED_MODEL,
   DEFAULT_QUERY_MODEL,
   DEFAULT_RERANK_MODEL,
   DEFAULT_MULTI_GET_MAX_BYTES,
@@ -202,9 +214,9 @@ import type { RankedResult } from "./store";
 
 describe("MCP Server", () => {
   beforeAll(async () => {
-    // LlamaCpp uses node-llama-cpp for local model inference (no HTTP mocking needed)
-    // Use shared singleton to avoid creating multiple instances with separate GPU resources
-    getDefaultLlamaCpp();
+    // Setup LLM (local or remote based on QMD_TEST_REMOTE env var)
+    await setupTestLLM();
+    console.log(`[mcp.test.ts] Running with ${getTestLLMDescription()}`);
 
     // Set up test config directory
     const configPrefix = join(tmpdir(), `qmd-mcp-config-${Date.now()}-${Math.random().toString(36).slice(2)}`);
@@ -296,21 +308,24 @@ describe("MCP Server", () => {
 
   describe("qmd_vsearch tool", () => {
     test("returns results for semantic query", async () => {
-      const results = await searchVec(testDb, "project documentation", DEFAULT_EMBED_MODEL, 10);
+      if (shouldSkipLLMTests()) return;
+      const results = await searchVec(testDb, "project documentation", getTestEmbedModel(), 10);
       expect(results.length).toBeGreaterThan(0);
     });
 
     test("respects limit parameter", async () => {
-      const results = await searchVec(testDb, "documentation", DEFAULT_EMBED_MODEL, 2);
+      if (shouldSkipLLMTests()) return;
+      const results = await searchVec(testDb, "documentation", getTestEmbedModel(), 2);
       expect(results.length).toBeLessThanOrEqual(2);
     });
 
     test("returns empty when no vector table exists", async () => {
+      if (shouldSkipLLMTests()) return;
       const emptyDb = new Database(":memory:");
       initTestDatabase(emptyDb);
       emptyDb.exec("DROP TABLE IF EXISTS vectors_vec");
 
-      const results = await searchVec(emptyDb, "test", DEFAULT_EMBED_MODEL, 10);
+      const results = await searchVec(emptyDb, "test", getTestEmbedModel(), 10);
       expect(results.length).toBe(0);
       emptyDb.close();
     });
@@ -322,6 +337,7 @@ describe("MCP Server", () => {
 
   describe("qmd_query tool", () => {
     test("expands query with variations", async () => {
+      if (shouldSkipLLMTests()) return;
       const queries = await expandQuery("api documentation", DEFAULT_QUERY_MODEL, testDb);
       // Always returns at least the original query, may have more if generation succeeds
       expect(queries.length).toBeGreaterThanOrEqual(1);
@@ -346,6 +362,7 @@ describe("MCP Server", () => {
     });
 
     test("reranks documents with LLM", async () => {
+      if (shouldSkipLLMTests()) return;
       const docs = [
         { file: "/test/docs/readme.md", text: "Project readme" },
         { file: "/test/docs/api.md", text: "API documentation" },
@@ -356,6 +373,7 @@ describe("MCP Server", () => {
     });
 
     test("full hybrid search pipeline", async () => {
+      if (shouldSkipLLMTests()) return;
       // Simulate full qmd_query flow
       const query = "meeting notes";
       const queries = await expandQuery(query, DEFAULT_QUERY_MODEL, testDb);

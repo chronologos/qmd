@@ -2,11 +2,12 @@
   "permissions": {
     "allow": [
       "Bash(bun run tsc:*)",
-      "Skill(jj-vcs)"
+      "Skill(jj-vcs)",
+      "Bash(bun test:*)"
     ]
   },
+  "enableAllProjectMcpServers": true,
   "enabledMcpjsonServers": [
     "anki"
-  ],
-  "enableAllProjectMcpServers": true
+  ]
 }

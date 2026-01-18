@@ -29,10 +29,17 @@ import {
   insertEmbedding,
   chunkDocumentByTokens,
   reciprocalRankFusion,
-  DEFAULT_EMBED_MODEL,
   type RankedResult,
 } from "./store";
-import { getDefaultLlamaCpp, formatDocForEmbedding, disposeDefaultLlamaCpp } from "./llm";
+import { formatDocForEmbedding } from "./llm";
+import {
+  setupTestLLM,
+  cleanupTestLLM,
+  getTestEmbedDimensions,
+  getTestEmbedModel,
+  getTestLLMDescription,
+  shouldSkipLLMTests,
+} from "./test-config";
 
 // Eval queries with expected documents
 const evalQueries: {
@@ -156,8 +163,15 @@ describe("Vector Search", () => {
   let store: ReturnType<typeof createStore>;
   let db: Database;
   let hasEmbeddings = false;
+  let embedModel: string;
+  let llm: Awaited<ReturnType<typeof setupTestLLM>>;
 
   beforeAll(async () => {
+    llm = await setupTestLLM();
+    if (!llm) return; // Skip if LLM not configured
+    embedModel = getTestEmbedModel();
+    console.log(`[eval.test.ts] Running with ${getTestLLMDescription()}`);
+
     store = createStore();
     db = store.db;
 
@@ -175,8 +189,7 @@ describe("Vector Search", () => {
     }
 
     // Generate embeddings for test documents
-    const llm = getDefaultLlamaCpp();
-    store.ensureVecTable(768); // embeddinggemma uses 768 dimensions
+    store.ensureVecTable(getTestEmbedDimensions());
 
     const evalDocsDir = join(import.meta.dir, "../test/eval-docs");
     const files = readdirSync(evalDocsDir).filter(f => f.endsWith(".md"));
@@ -192,12 +205,12 @@ describe("Vector Search", () => {
         const chunk = chunks[seq];
         if (!chunk) continue;
         const formatted = formatDocForEmbedding(chunk.text, title);
-        const result = await llm.embed(formatted, { model: DEFAULT_EMBED_MODEL, isQuery: false });
+        const result = await llm.embed(formatted, { model: embedModel, isQuery: false });
         if (result?.embedding) {
           // Convert to Float32Array for sqlite-vec
           const embedding = new Float32Array(result.embedding);
           const now = new Date().toISOString();
-          insertEmbedding(db, hash, seq, chunk.pos, embedding, DEFAULT_EMBED_MODEL, now);
+          insertEmbedding(db, hash, seq, chunk.pos, embedding, embedModel, now);
         }
       }
     }
@@ -205,31 +218,31 @@ describe("Vector Search", () => {
   }, 120000); // 2 minute timeout for embedding generation
 
   afterAll(() => {
-    store.close();
+    store?.close();
   });
 
   // Note: Don't dispose here - Hybrid tests also use llama.
   // Dispose happens in the global afterAll.
 
   test("easy queries: ≥60% Hit@3 (vector should match keywords too)", async () => {
-    if (!hasEmbeddings) return; // Skip if embedding failed
+    if (!llm || !hasEmbeddings) return; // Skip if LLM not configured or embedding failed
 
     const easyQueries = evalQueries.filter(q => q.difficulty === "easy");
     let hits = 0;
     for (const { query, expectedDoc } of easyQueries) {
-      const results = await searchVec(db, query, DEFAULT_EMBED_MODEL, 5);
+      const results = await searchVec(db, query, embedModel, 5);
       if (results.slice(0, 3).some(r => matchesExpected(r.filepath, expectedDoc))) hits++;
     }
     expect(hits / easyQueries.length).toBeGreaterThanOrEqual(0.6);
   }, 60000);
 
   test("medium queries: ≥40% Hit@3 (vector excels at semantic)", async () => {
-    if (!hasEmbeddings) return;
+    if (!llm || !hasEmbeddings) return;
 
     const mediumQueries = evalQueries.filter(q => q.difficulty === "medium");
     let hits = 0;
     for (const { query, expectedDoc } of mediumQueries) {
-      const results = await searchVec(db, query, DEFAULT_EMBED_MODEL, 5);
+      const results = await searchVec(db, query, embedModel, 5);
       if (results.slice(0, 3).some(r => matchesExpected(r.filepath, expectedDoc))) hits++;
     }
     // Vector search should do better on semantic queries than BM25
@@ -237,23 +250,23 @@ describe("Vector Search", () => {
   }, 60000);
 
   test("hard queries: ≥30% Hit@5 (vector helps with vague queries)", async () => {
-    if (!hasEmbeddings) return;
+    if (!llm || !hasEmbeddings) return;
 
     const hardQueries = evalQueries.filter(q => q.difficulty === "hard");
     let hits = 0;
     for (const { query, expectedDoc } of hardQueries) {
-      const results = await searchVec(db, query, DEFAULT_EMBED_MODEL, 5);
+      const results = await searchVec(db, query, embedModel, 5);
       if (results.some(r => matchesExpected(r.filepath, expectedDoc))) hits++;
     }
     expect(hits / hardQueries.length).toBeGreaterThanOrEqual(0.3);
   }, 60000);
 
   test("overall Hit@3 ≥50% (vector baseline)", async () => {
-    if (!hasEmbeddings) return;
+    if (!llm || !hasEmbeddings) return;
 
     let hits = 0;
     for (const { query, expectedDoc } of evalQueries) {
-      const results = await searchVec(db, query, DEFAULT_EMBED_MODEL, 5);
+      const results = await searchVec(db, query, embedModel, 5);
       if (results.slice(0, 3).some(r => matchesExpected(r.filepath, expectedDoc))) hits++;
     }
     expect(hits / evalQueries.length).toBeGreaterThanOrEqual(0.5);
@@ -269,7 +282,9 @@ describe("Hybrid Search (RRF)", () => {
   let db: Database;
   let hasVectors = false;
 
-  beforeAll(() => {
+  beforeAll(async () => {
+    if (shouldSkipLLMTests()) return; // Skip if LLM not configured
+
     store = createStore();
     db = store.db;
     // Check if vectors exist
@@ -283,7 +298,7 @@ describe("Hybrid Search (RRF)", () => {
   });
 
   afterAll(() => {
-    store.close();
+    store?.close();
   });
 
   // Helper: run hybrid search with RRF fusion
@@ -303,7 +318,7 @@ describe("Hybrid Search (RRF)", () => {
     }
 
     // Vector results
-    const vecResults = await searchVec(db, query, DEFAULT_EMBED_MODEL, 20);
+    const vecResults = await searchVec(db, query, getTestEmbedModel(), 20);
     if (vecResults.length > 0) {
       rankedLists.push(vecResults.map(r => ({
         file: r.filepath,
@@ -322,6 +337,7 @@ describe("Hybrid Search (RRF)", () => {
   }
 
   test("easy queries: ≥80% Hit@3 (hybrid should match BM25)", async () => {
+    if (shouldSkipLLMTests()) return;
     const easyQueries = evalQueries.filter(q => q.difficulty === "easy");
     let hits = 0;
     for (const { query, expectedDoc } of easyQueries) {
@@ -332,6 +348,7 @@ describe("Hybrid Search (RRF)", () => {
   }, 60000);
 
   test("medium queries: ≥50% Hit@3 with vectors, ≥15% without", async () => {
+    if (shouldSkipLLMTests()) return;
     const mediumQueries = evalQueries.filter(q => q.difficulty === "medium");
     let hits = 0;
     for (const { query, expectedDoc } of mediumQueries) {
@@ -345,6 +362,7 @@ describe("Hybrid Search (RRF)", () => {
   }, 60000);
 
   test("hard queries: ≥35% Hit@5 with vectors, ≥15% without", async () => {
+    if (shouldSkipLLMTests()) return;
     const hardQueries = evalQueries.filter(q => q.difficulty === "hard");
     let hits = 0;
     for (const { query, expectedDoc } of hardQueries) {
@@ -356,7 +374,7 @@ describe("Hybrid Search (RRF)", () => {
   }, 60000);
 
   test("fusion queries: ≥50% Hit@3 (RRF combines weak signals)", async () => {
-    if (!hasVectors) return; // Fusion requires both methods
+    if (shouldSkipLLMTests() || !hasVectors) return; // Fusion requires both methods
 
     const fusionQueries = evalQueries.filter(q => q.difficulty === "fusion");
     let hybridHits = 0;
@@ -373,7 +391,7 @@ describe("Hybrid Search (RRF)", () => {
       if (bm25Results.slice(0, 3).some(r => matchesExpected(r.filepath, expectedDoc))) bm25Hits++;
 
       // Vector results for comparison
-      const vecResults = await searchVec(db, query, DEFAULT_EMBED_MODEL, 5);
+      const vecResults = await searchVec(db, query, getTestEmbedModel(), 5);
       if (vecResults.slice(0, 3).some(r => matchesExpected(r.filepath, expectedDoc))) vecHits++;
     }
 
@@ -389,6 +407,7 @@ describe("Hybrid Search (RRF)", () => {
   }, 60000);
 
   test("overall Hit@3 ≥60% with vectors, ≥40% without", async () => {
+    if (shouldSkipLLMTests()) return;
     // Filter out fusion queries for overall score (they're tested separately)
     const standardQueries = evalQueries.filter(q => q.difficulty !== "fusion");
     let hits = 0;
@@ -407,6 +426,6 @@ describe("Hybrid Search (RRF)", () => {
 
 afterAll(async () => {
   // Ensure native resources are released to avoid ggml-metal asserts on process exit.
-  await disposeDefaultLlamaCpp();
+  await cleanupTestLLM();
   rmSync(tempDir, { recursive: true, force: true });
 });

@@ -3,29 +3,48 @@
  *
  * Run with: bun test src/llm.test.ts
  *
- * These tests require the actual models to be downloaded. Run the embed or
- * rerank functions first to trigger model downloads.
+ * These tests require LLM configuration:
+ *   QMD_TEST_REMOTE=1  - Use remote LLM backend
+ *   QMD_TEST_LOCAL=1   - Use local LLM backend (downloads models)
+ *
+ * If neither is set, LLM tests will be skipped.
  */
 
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import {
   LlamaCpp,
   getDefaultLlamaCpp,
-  disposeDefaultLlamaCpp,
   type RerankDocument,
 } from "./llm.js";
+import {
+  setupTestLLM,
+  cleanupTestLLM,
+  getTestEmbedDimensions,
+  getTestLLMDescription,
+  shouldUseRemoteLLM,
+  shouldSkipLLMTests,
+} from "./test-config.js";
 
 // =============================================================================
 // Singleton Tests (no model loading required)
 // =============================================================================
 
-describe("Default LlamaCpp Singleton", () => {
+describe("Default LLM Singleton", () => {
+  beforeAll(async () => {
+    await setupTestLLM();
+  });
+
   // Test singleton behavior without resetting to avoid orphan instances
   test("getDefaultLlamaCpp returns same instance on subsequent calls", () => {
+    if (shouldSkipLLMTests()) return;
+
     const llm1 = getDefaultLlamaCpp();
     const llm2 = getDefaultLlamaCpp();
     expect(llm1).toBe(llm2);
-    expect(llm1).toBeInstanceOf(LlamaCpp);
+    // Instance type depends on configuration (LlamaCpp or RemoteLLM)
+    if (!shouldUseRemoteLLM()) {
+      expect(llm1).toBeInstanceOf(LlamaCpp);
+    }
   });
 });
 
@@ -35,6 +54,8 @@ describe("Default LlamaCpp Singleton", () => {
 
 describe("LlamaCpp.modelExists", () => {
   test("returns exists:true for HuggingFace model URIs", async () => {
+    if (shouldSkipLLMTests()) return;
+
     const llm = getDefaultLlamaCpp();
     const result = await llm.modelExists("hf:org/repo/model.gguf");
 
@@ -43,6 +64,10 @@ describe("LlamaCpp.modelExists", () => {
   });
 
   test("returns exists:false for non-existent local paths", async () => {
+    if (shouldSkipLLMTests()) return;
+    // This test only makes sense for local LLM - remote doesn't check local filesystem
+    if (shouldUseRemoteLLM()) return;
+
     const llm = getDefaultLlamaCpp();
     const result = await llm.modelExists("/nonexistent/path/model.gguf");
 
@@ -55,27 +80,36 @@ describe("LlamaCpp.modelExists", () => {
 // Integration Tests (require actual models)
 // =============================================================================
 
-describe("LlamaCpp Integration", () => {
+describe("LLM Integration", () => {
   // Use the singleton to avoid multiple Metal contexts
-  const llm = getDefaultLlamaCpp();
+  let llm: ReturnType<typeof getDefaultLlamaCpp> | null;
+
+  beforeAll(async () => {
+    llm = await setupTestLLM();
+    console.log(`[llm.test.ts] Running with ${getTestLLMDescription()}`);
+  });
 
   afterAll(async () => {
     // Ensure native resources are released to avoid ggml-metal asserts on process exit.
-    await disposeDefaultLlamaCpp();
+    await cleanupTestLLM();
   });
 
   describe("embed", () => {
     test("returns embedding with correct dimensions", async () => {
+      if (!llm) return;
+
       const result = await llm.embed("Hello world");
 
       expect(result).not.toBeNull();
       expect(result!.embedding).toBeInstanceOf(Array);
       expect(result!.embedding.length).toBeGreaterThan(0);
-      // embeddinggemma outputs 768 dimensions
-      expect(result!.embedding.length).toBe(768);
+      // Dimension depends on model: embeddinggemma=768, Qwen3-Embedding-4B=2560
+      expect(result!.embedding.length).toBe(getTestEmbedDimensions());
     });
 
     test("returns consistent embeddings for same input", async () => {
+      if (!llm) return;
+
       const result1 = await llm.embed("test text");
       const result2 = await llm.embed("test text");
 
@@ -89,6 +123,8 @@ describe("LlamaCpp Integration", () => {
     });
 
     test("returns different embeddings for different inputs", async () => {
+      if (!llm) return;
+
       const result1 = await llm.embed("cats are great");
       const result2 = await llm.embed("database optimization");
 
@@ -114,24 +150,28 @@ describe("LlamaCpp Integration", () => {
 
   describe("embedBatch", () => {
     test("returns embeddings for multiple texts", async () => {
+      if (!llm) return;
+
       const texts = ["Hello world", "Test text", "Another document"];
       const results = await llm.embedBatch(texts);
 
       expect(results).toHaveLength(3);
       for (const result of results) {
         expect(result).not.toBeNull();
-        expect(result!.embedding.length).toBe(768);
+        expect(result!.embedding.length).toBe(getTestEmbedDimensions());
       }
     });
 
     test("returns same results as individual embed calls", async () => {
+      if (!llm) return;
+
       const texts = ["cats are great", "dogs are awesome"];
 
       // Get batch embeddings
       const batchResults = await llm.embedBatch(texts);
 
       // Get individual embeddings
-      const individualResults = await Promise.all(texts.map(t => llm.embed(t)));
+      const individualResults = await Promise.all(texts.map(t => llm!.embed(t)));
 
       // Compare - should be identical
       for (let i = 0; i < texts.length; i++) {
@@ -144,11 +184,15 @@ describe("LlamaCpp Integration", () => {
     });
 
     test("handles empty array", async () => {
+      if (!llm) return;
+
       const results = await llm.embedBatch([]);
       expect(results).toHaveLength(0);
     });
 
     test("batch is faster than sequential", async () => {
+      if (!llm) return;
+
       const texts = Array(10).fill(null).map((_, i) => `Document number ${i} with content`);
 
       // Time batch
@@ -171,6 +215,8 @@ describe("LlamaCpp Integration", () => {
 
   describe("rerank", () => {
     test("scores capital of France question correctly", async () => {
+      if (!llm) return;
+
       const query = "What is the capital of France?";
       const documents: RerankDocument[] = [
         { file: "butterflies.txt", text: "Butterflies indeed fly through the garden." },
@@ -195,6 +241,8 @@ describe("LlamaCpp Integration", () => {
     });
 
     test("scores authentication query correctly", async () => {
+      if (!llm) return;
+
       const query = "How do I configure authentication?";
       const documents: RerankDocument[] = [
         { file: "weather.md", text: "The weather today is sunny with mild temperatures." },
@@ -219,6 +267,8 @@ describe("LlamaCpp Integration", () => {
     });
 
     test("handles programming queries correctly", async () => {
+      if (!llm) return;
+
       const query = "How do I handle errors in JavaScript?";
       const documents: RerankDocument[] = [
         { file: "cooking.md", text: "To make a good pasta, boil water and add salt." },
@@ -238,17 +288,25 @@ describe("LlamaCpp Integration", () => {
     });
 
     test("handles empty document list", async () => {
+      if (!llm) return;
+      // Remote API returns 400 for empty documents - skip for remote
+      if (shouldUseRemoteLLM()) return;
+
       const result = await llm.rerank("test query", []);
       expect(result.results).toHaveLength(0);
     });
 
     test("handles single document", async () => {
+      if (!llm) return;
+
       const result = await llm.rerank("test", [{ file: "doc.md", text: "content" }]);
       expect(result.results).toHaveLength(1);
       expect(result.results[0]!.file).toBe("doc.md");
     });
 
     test("preserves original file paths", async () => {
+      if (!llm) return;
+
       const documents: RerankDocument[] = [
         { file: "path/to/doc1.md", text: "content one" },
         { file: "another/path/doc2.md", text: "content two" },
@@ -261,6 +319,8 @@ describe("LlamaCpp Integration", () => {
     });
 
     test("returns scores between 0 and 1", async () => {
+      if (!llm) return;
+
       const documents: RerankDocument[] = [
         { file: "a.md", text: "The quick brown fox jumps over the lazy dog." },
         { file: "b.md", text: "Machine learning algorithms process data efficiently." },
@@ -276,6 +336,8 @@ describe("LlamaCpp Integration", () => {
     });
 
     test("batch reranks multiple documents efficiently", async () => {
+      if (!llm) return;
+
       // Create 10 documents to verify batch processing works
       const documents: RerankDocument[] = Array(10)
         .fill(null)
@@ -303,6 +365,8 @@ describe("LlamaCpp Integration", () => {
 
   describe("expandQuery", () => {
     test("returns query expansions with correct types", async () => {
+      if (!llm) return;
+
       const result = await llm.expandQuery("test query");
 
       // Result is Queryable[] containing lex, vec, and/or hyde entries
@@ -316,6 +380,8 @@ describe("LlamaCpp Integration", () => {
     }, 30000); // 30s timeout for model loading
 
     test("can exclude lexical queries", async () => {
+      if (!llm) return;
+
       const result = await llm.expandQuery("authentication setup", { includeLexical: false });
 
       // Should not contain any 'lex' type entries
@@ -324,4 +390,3 @@ describe("LlamaCpp Integration", () => {
     });
   });
 });
-
