@@ -1893,15 +1893,17 @@ describe("LlamaCpp Integration", () => {
     });
 
     // Create vector table and insert a test vector
-    store.ensureVecTable(768);
-    const embedding = Array(768).fill(0).map(() => Math.random());
-    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'test', ?)`).run(hash, new Date().toISOString());
+    const dim = getTestEmbedDimensions();
+    const model = getTestEmbedModel();
+    store.ensureVecTable(dim);
+    const embedding = Array(dim).fill(0).map(() => Math.random());
+    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, ?, ?)`).run(hash, model, new Date().toISOString());
     store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${hash}_0`, new Float32Array(embedding));
 
     // This should complete quickly (not hang) due to the two-step fix
     // The old code with JOINs in the sqlite-vec query would hang indefinitely
     const startTime = Date.now();
-    const results = await store.searchVec("test content", "embeddinggemma", 5);
+    const results = await store.searchVec("test content", model, 5);
     const elapsed = Date.now() - startTime;
 
     // If the query took more than 5 seconds, something is wrong
