@@ -387,6 +387,6 @@ describe("LLM Integration", () => {
       // Should not contain any 'lex' type entries
       const lexEntries = result.filter(q => q.type === "lex");
       expect(lexEntries).toHaveLength(0);
-    });
+    }, 30000); // 30s timeout for remote generation
   });
 });

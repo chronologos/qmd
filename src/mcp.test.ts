@@ -406,7 +406,7 @@ describe("MCP Server", () => {
       );
 
       expect(reranked.length).toBeGreaterThan(0);
-    });
+    }, 60000); // 60s timeout for expandQuery + rerank pipeline
   });
 
   // ===========================================================================
