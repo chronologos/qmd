@@ -262,18 +262,47 @@ export function toVirtualPath(db: Database, absolutePath: string): string | null
 // Database initialization
 // =============================================================================
 
-// On macOS, use Homebrew's SQLite which supports extensions
-if (process.platform === "darwin") {
-  const homebrewSqlitePath = "/opt/homebrew/opt/sqlite/lib/libsqlite3.dylib";
-  try {
-    if (Bun.file(homebrewSqlitePath).size > 0) {
-      Database.setCustomSQLite(homebrewSqlitePath);
+function setSQLiteFromBrewPrefixEnv(): void {
+  const candidates: string[] = [];
+
+  if (process.platform === "darwin") {
+    // Use BREW_PREFIX for non-standard Homebrew installs (common on corporate Macs).
+    const brewPrefix = Bun.env.BREW_PREFIX || Bun.env.HOMEBREW_PREFIX;
+    if (brewPrefix) {
+      // Homebrew can place SQLite in opt/sqlite (keg-only) or directly under the prefix.
+      candidates.push(`${brewPrefix}/opt/sqlite/lib/libsqlite3.dylib`);
+      candidates.push(`${brewPrefix}/lib/libsqlite3.dylib`);
+    } else {
+      candidates.push("/opt/homebrew/opt/sqlite/lib/libsqlite3.dylib");
+      candidates.push("/usr/local/opt/sqlite/lib/libsqlite3.dylib");
     }
-  } catch { }
+  }
+
+  for (const candidate of candidates) {
+    try {
+      if (Bun.file(candidate).size > 0) {
+        Database.setCustomSQLite(candidate);
+        return;
+      }
+    } catch { }
+  }
 }
 
+setSQLiteFromBrewPrefixEnv();
+
 function initializeDatabase(db: Database): void {
-  sqliteVec.load(db);
+  try {
+    sqliteVec.load(db);
+  } catch (err) {
+    if (err instanceof Error && err.message.includes("does not support dynamic extension loading")) {
+      throw new Error(
+        "SQLite build does not support dynamic extension loading. " +
+        "Install Homebrew SQLite so the sqlite-vec extension can be loaded, " +
+        "and set BREW_PREFIX if Homebrew is installed in a non-standard location."
+      );
+    }
+    throw err;
+  }
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA foreign_keys = ON");
 
@@ -334,11 +363,9 @@ function initializeDatabase(db: Database): void {
       pos INTEGER NOT NULL DEFAULT 0,
       model TEXT NOT NULL,
       embedded_at TEXT NOT NULL,
-      hash_seq TEXT GENERATED ALWAYS AS (hash || '_' || seq) STORED,
       PRIMARY KEY (hash, seq)
     )
   `);
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_content_vectors_hash_seq ON content_vectors(hash_seq)`);
 
   // FTS - index filepath (collection/path), title, and content
   db.exec(`
@@ -1148,13 +1175,47 @@ function levenshtein(a: string, b: string): number {
 }
 
 /**
+ * Normalize a docid input by stripping surrounding quotes and leading #.
+ * Handles: "#abc123", 'abc123', "abc123", #abc123, abc123
+ * Returns the bare hex string.
+ */
+export function normalizeDocid(docid: string): string {
+  let normalized = docid.trim();
+
+  // Strip surrounding quotes (single or double)
+  if ((normalized.startsWith('"') && normalized.endsWith('"')) ||
+      (normalized.startsWith("'") && normalized.endsWith("'"))) {
+    normalized = normalized.slice(1, -1);
+  }
+
+  // Strip leading # if present
+  if (normalized.startsWith('#')) {
+    normalized = normalized.slice(1);
+  }
+
+  return normalized;
+}
+
+/**
+ * Check if a string looks like a docid reference.
+ * Accepts: #abc123, abc123, "#abc123", "abc123", '#abc123', 'abc123'
+ * Returns true if the normalized form is a valid hex string of 6+ chars.
+ */
+export function isDocid(input: string): boolean {
+  const normalized = normalizeDocid(input);
+  // Must be at least 6 hex characters
+  return normalized.length >= 6 && /^[a-f0-9]+$/i.test(normalized);
+}
+
+/**
  * Find a document by its short docid (first 6 characters of hash).
  * Returns the document's virtual path if found, null otherwise.
  * If multiple documents match the same short hash (collision), returns the first one.
+ *
+ * Accepts lenient input: #abc123, abc123, "#abc123", "abc123"
  */
 export function findDocumentByDocid(db: Database, docid: string): { filepath: string; hash: string } | null {
-  // Normalize: remove leading # if present
-  const shortHash = docid.startsWith('#') ? docid.slice(1) : docid;
+  const shortHash = normalizeDocid(docid);
 
   if (shortHash.length < 1) return null;
 
@@ -1680,48 +1741,67 @@ export async function searchVec(db: Database, query: string, model: string, limi
 
   const embedding = await getEmbedding(query, model, true);
   if (!embedding) return [];
-  // sqlite-vec requires "k = ?" for KNN queries
-  let sql = `
+
+  // IMPORTANT: We use a two-step query approach here because sqlite-vec virtual tables
+  // hang indefinitely when combined with JOINs in the same query. Do NOT try to
+  // "optimize" this by combining into a single query with JOINs - it will break.
+  // See: https://github.com/tobi/qmd/pull/23
+
+  // Step 1: Get vector matches from sqlite-vec (no JOINs allowed)
+  const vecResults = db.prepare(`
+    SELECT hash_seq, distance
+    FROM vectors_vec
+    WHERE embedding MATCH ? AND k = ?
+  `).all(new Float32Array(embedding), limit * 3) as { hash_seq: string; distance: number }[];
+
+  if (vecResults.length === 0) return [];
+
+  // Step 2: Get chunk info and document data
+  const hashSeqs = vecResults.map(r => r.hash_seq);
+  const distanceMap = new Map(vecResults.map(r => [r.hash_seq, r.distance]));
+
+  // Build query for document lookup
+  const placeholders = hashSeqs.map(() => '?').join(',');
+  let docSql = `
     SELECT
-      v.hash_seq,
-      v.distance,
+      cv.hash || '_' || cv.seq as hash_seq,
+      cv.hash,
+      cv.pos,
       'qmd://' || d.collection || '/' || d.path as filepath,
       d.collection || '/' || d.path as display_path,
       d.title,
-      content.doc as body,
-      cv.hash,
-      cv.pos
-    FROM vectors_vec v
-    JOIN content_vectors cv ON cv.hash_seq = v.hash_seq
+      content.doc as body
+    FROM content_vectors cv
     JOIN documents d ON d.hash = cv.hash AND d.active = 1
     JOIN content ON content.hash = d.hash
-    WHERE v.embedding MATCH ? AND k = ?
+    WHERE cv.hash || '_' || cv.seq IN (${placeholders})
   `;
-
-  const params: (Float32Array | number | string)[] = [new Float32Array(embedding), limit * 3];
+  const params: string[] = [...hashSeqs];
 
   if (collectionId) {
-    // Filter by collection name
-    sql += ` AND d.collection = ?`;
+    docSql += ` AND d.collection = ?`;
     params.push(String(collectionId));
   }
 
-  sql += ` ORDER BY v.distance`;
+  const docRows = db.prepare(docSql).all(...params) as {
+    hash_seq: string; hash: string; pos: number; filepath: string;
+    display_path: string; title: string; body: string;
+  }[];
 
-  const rows = db.prepare(sql).all(...params) as { hash_seq: string; distance: number; filepath: string; display_path: string; title: string; body: string; hash: string; pos: number }[];
-
-  const seen = new Map<string, { row: typeof rows[0]; bestDist: number }>();
-  for (const row of rows) {
+  // Combine with distances and dedupe by filepath
+  const seen = new Map<string, { row: typeof docRows[0]; bestDist: number }>();
+  for (const row of docRows) {
+    const distance = distanceMap.get(row.hash_seq) ?? 1;
     const existing = seen.get(row.filepath);
-    if (!existing || row.distance < existing.bestDist) {
-      seen.set(row.filepath, { row, bestDist: row.distance });
+    if (!existing || distance < existing.bestDist) {
+      seen.set(row.filepath, { row, bestDist: distance });
     }
   }
 
   return Array.from(seen.values())
     .sort((a, b) => a.bestDist - b.bestDist)
     .slice(0, limit)
-    .map(({ row }) => {
+    .map(({ row, bestDist }) => {
       const collectionName = row.filepath.split('//')[1]?.split('/')[0] || "";
       return {
         filepath: row.filepath,
@@ -1734,7 +1814,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
         bodyLength: row.body.length,
         body: row.body,
         context: getContextForFile(db, row.filepath),
-        score: 1 - row.distance,  // Cosine similarity = 1 - cosine distance
+        score: 1 - bestDist,  // Cosine similarity = 1 - cosine distance
         source: "vec" as const,
         chunkPos: row.pos,
       };
@@ -1945,8 +2025,8 @@ export function findDocument(db: Database, filename: string, options: { includeB
     filepath = filepath.slice(0, -colonMatch[0].length);
   }
 
-  // Check if this is a docid lookup (#hash or just 6-char hex)
-  if (filepath.startsWith('#') || /^[a-f0-9]{6}$/i.test(filepath)) {
+  // Check if this is a docid lookup (#abc123, abc123, "#abc123", "abc123", etc.)
+  if (isDocid(filepath)) {
     const docidMatch = findDocumentByDocid(db, filepath);
     if (docidMatch) {
       filepath = docidMatch.filepath;

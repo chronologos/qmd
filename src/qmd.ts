@@ -18,6 +18,8 @@ import {
   removeCollection,
   renameCollection,
   findSimilarFiles,
+  findDocumentByDocid,
+  isDocid,
   matchFilesByGlob,
   getHashesNeedingEmbedding,
   getHashesForEmbedding,
@@ -448,11 +450,19 @@ async function updateCollections(): Promise<void> {
       }
     }
 
-    await indexFiles(col.pwd, col.glob_pattern, col.name);
+    await indexFiles(col.pwd, col.glob_pattern, col.name, true);
     console.log("");
   }
 
+  // Check if any documents need embedding (show once at end)
+  const finalDb = getDb();
+  const needsEmbedding = getHashesNeedingEmbedding(finalDb);
+  closeDb();
+
   console.log(`${c.green}✓ All collections updated.${c.reset}`);
+  if (needsEmbedding > 0) {
+    console.log(`\nRun 'qmd embed' to update embeddings (${needsEmbedding} unique hashes need vectors)`);
+  }
 }
 
 /**
@@ -712,6 +722,18 @@ function getDocument(filename: string, fromLine?: number, maxLines?: number, lin
     if (matched) {
       fromLine = parseInt(matched, 10);
       inputPath = inputPath.slice(0, -colonMatch[0].length);
+    }
+  }
+
+  // Handle docid lookup (#abc123, abc123, "#abc123", "abc123", etc.)
+  if (isDocid(inputPath)) {
+    const docidMatch = findDocumentByDocid(db, inputPath);
+    if (docidMatch) {
+      inputPath = docidMatch.filepath;
+    } else {
+      console.error(`Document not found: ${filename}`);
+      closeDb();
+      process.exit(1);
     }
   }
 
@@ -1366,7 +1388,7 @@ function collectionRename(oldName: string, newName: string): void {
   console.log(`  Virtual paths updated: ${c.cyan}qmd://${oldName}/${c.reset} → ${c.cyan}qmd://${newName}/${c.reset}`);
 }
 
-async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, collectionName?: string): Promise<void> {
+async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, collectionName?: string, suppressEmbedNotice: boolean = false): Promise<void> {
   const db = getDb();
   const resolvedPwd = pwd || getPwd();
   const now = new Date().toISOString();
@@ -1487,7 +1509,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
     console.log(`Cleaned up ${orphanedContent} orphaned content hash(es)`);
   }
 
-  if (needsEmbedding > 0) {
+  if (needsEmbedding > 0 && !suppressEmbedNotice) {
     console.log(`\nRun 'qmd embed' to update embeddings (${needsEmbedding} unique hashes need vectors)`);
   }
 
@@ -2011,8 +2033,11 @@ async function vectorSearch(query: string, opts: OutputOptions, model: string = 
   const perQueryLimit = opts.all ? 500 : 20;
   const allResults = new Map<string, { file: string; displayPath: string; title: string; body: string; score: number; hash: string }>();
 
-  // Use Promise.all for concurrent vector searches
-  await Promise.all(vectorQueries.map(async (q) => {
+  // IMPORTANT: Run vector searches sequentially, not with Promise.all.
+  // node-llama-cpp's embedding context hangs when multiple concurrent embed() calls
+  // are made. This is a known limitation of the LlamaEmbeddingContext.
+  // See: https://github.com/tobi/qmd/pull/23
+  for (const q of vectorQueries) {
     const vecResults = await searchVec(db, q, model, perQueryLimit, collectionName as any);
     for (const r of vecResults) {
       const existing = allResults.get(r.filepath);
@@ -2020,7 +2045,7 @@ async function vectorSearch(query: string, opts: OutputOptions, model: string = 
         allResults.set(r.filepath, { file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score, hash: r.hash });
       }
     }
-  }));
+  }
 
   // Sort by max score and limit to requested count
   const results = Array.from(allResults.values())
@@ -2863,8 +2888,9 @@ if (import.meta.main) {
       process.exit(1);
   }
 
-  // Cleanup LlamaCpp instance to prevent NAPI crash on exit
-  await disposeDefaultLlamaCpp();
-  process.exit(0);
+  if (cli.command !== "mcp") {
+    await disposeDefaultLlamaCpp();
+    process.exit(0);
+  }
 
 } // end if (import.meta.main)
