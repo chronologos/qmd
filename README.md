@@ -248,6 +248,63 @@ qmd ls notes
 qmd ls notes/subfolder
 ```
 
+### Anki Collections
+
+QMD can index Anki flashcards as searchable documents via [AnkiConnect](https://ankiweb.net/shared/info/2055492159).
+
+**Prerequisites:**
+- Anki desktop running
+- AnkiConnect plugin installed (code: 2055492159)
+
+```sh
+# Test AnkiConnect connection
+qmd anki test
+
+# List all Anki decks
+qmd anki decks
+
+# Create an Anki collection (indexes all decks)
+qmd collection add --anki --name flashcards
+
+# Create with deck filter
+qmd collection add --anki --name coding --deck "Programming"
+qmd collection add --anki --name coding --deck "Programming::Rust" --deck "Programming::Go"
+
+# Create with note type filter
+qmd collection add --anki --name cloze-only --deck "Default" --note-type Cloze
+
+# Create with tag filter
+qmd collection add --anki --name thinking --tag "thinking::*"
+
+# Search flashcards
+qmd search "closure" -c flashcards
+```
+
+**How it works:**
+- Each Anki **note** becomes a document (not cards—one note can generate multiple cards)
+- Document path: `{deck}/{noteId}.anki` (e.g., `Programming/Rust/1234567890.anki`)
+- Deck hierarchy (`::`) maps to path hierarchy (`/`)
+- All fields are indexed as markdown with HTML stripped
+- Cloze deletions (`{{c1::...}}`) are preserved for searchability
+
+**YAML Configuration** (`~/.config/qmd/index.yml`):
+
+```yaml
+collections:
+  flashcards:
+    source: anki
+    decks:                    # Optional - all decks if omitted
+      - Salience
+      - "Programming::Rust"
+    note_types:               # Optional filter
+      - Basic
+      - Cloze
+    tags:                     # Optional filter (OR logic)
+      - "thinking::*"
+```
+
+**Note:** Anki must be running during `qmd update` to re-sync flashcards.
+
 ### Generate Vector Embeddings
 
 ```sh
@@ -431,6 +488,7 @@ documents_fts   -- FTS5 full-text index
 content_vectors -- Embedding chunks (hash, seq, pos, 800 tokens each)
 vectors_vec     -- sqlite-vec vector index (hash_seq key)
 llm_cache       -- Cached LLM responses (query expansion, rerank scores)
+anki_metadata   -- Anki note sync state (note_id, mod_time, hash)
 ```
 
 ## Environment Variables

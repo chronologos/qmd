@@ -29,6 +29,8 @@ import {
   listAllContexts as collectionsListAllContexts,
   getCollection,
   listCollections as collectionsListCollections,
+  listFilesystemCollections,
+  isFilesystemCollection,
   addCollection as collectionsAddCollection,
   removeCollection as collectionsRemoveCollection,
   renameCollection as collectionsRenameCollection,
@@ -230,8 +232,8 @@ export function resolveVirtualPath(db: Database, virtualPath: string): string | 
  * Returns null if the file is not in any indexed collection.
  */
 export function toVirtualPath(db: Database, absolutePath: string): string | null {
-  // Get all collections from YAML config
-  const collections = collectionsListCollections();
+  // Get filesystem collections from YAML config (Anki collections don't have filesystem paths)
+  const collections = listFilesystemCollections();
 
   // Find which collection this absolute path belongs to
   for (const coll of collections) {
@@ -412,6 +414,18 @@ function initializeDatabase(db: Database): void {
       WHERE new.active = 1;
     END
   `);
+
+  // Anki metadata table - tracks sync state for Anki notes
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS anki_metadata (
+      collection TEXT NOT NULL,
+      note_id INTEGER NOT NULL,
+      mod_time INTEGER NOT NULL,
+      hash TEXT NOT NULL,
+      PRIMARY KEY (collection, note_id)
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_anki_metadata_collection ON anki_metadata(collection)`);
 }
 
 
@@ -995,6 +1009,134 @@ export function getActiveDocumentPaths(db: Database, collectionName: string): st
   return rows.map(r => r.path);
 }
 
+// =============================================================================
+// Anki Metadata Helpers
+// =============================================================================
+
+/**
+ * Anki note metadata for tracking sync state
+ */
+export interface AnkiMetadata {
+  collection: string;
+  noteId: number;
+  modTime: number;
+  hash: string;
+}
+
+/**
+ * Get Anki metadata for a specific note in a collection
+ */
+export function getAnkiMetadata(
+  db: Database,
+  collection: string,
+  noteId: number
+): AnkiMetadata | null {
+  const row = db.prepare(`
+    SELECT collection, note_id, mod_time, hash
+    FROM anki_metadata
+    WHERE collection = ? AND note_id = ?
+  `).get(collection, noteId) as { collection: string; note_id: number; mod_time: number; hash: string } | null;
+
+  if (!row) return null;
+
+  return {
+    collection: row.collection,
+    noteId: row.note_id,
+    modTime: row.mod_time,
+    hash: row.hash,
+  };
+}
+
+/**
+ * Get all Anki metadata for a collection
+ */
+export function getAllAnkiMetadata(
+  db: Database,
+  collection: string
+): AnkiMetadata[] {
+  const rows = db.prepare(`
+    SELECT collection, note_id, mod_time, hash
+    FROM anki_metadata
+    WHERE collection = ?
+  `).all(collection) as Array<{ collection: string; note_id: number; mod_time: number; hash: string }>;
+
+  return rows.map(row => ({
+    collection: row.collection,
+    noteId: row.note_id,
+    modTime: row.mod_time,
+    hash: row.hash,
+  }));
+}
+
+/**
+ * Insert or update Anki metadata for a note
+ */
+export function upsertAnkiMetadata(
+  db: Database,
+  collection: string,
+  noteId: number,
+  modTime: number,
+  hash: string
+): void {
+  db.prepare(`
+    INSERT INTO anki_metadata (collection, note_id, mod_time, hash)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT (collection, note_id)
+    DO UPDATE SET mod_time = excluded.mod_time, hash = excluded.hash
+  `).run(collection, noteId, modTime, hash);
+}
+
+/**
+ * Delete Anki metadata for notes that no longer exist
+ * Returns the number of deleted entries
+ */
+export function deleteAnkiMetadata(
+  db: Database,
+  collection: string,
+  noteIds: number[]
+): number {
+  if (noteIds.length === 0) return 0;
+
+  // Use a transaction for efficiency with large sets
+  const stmt = db.prepare(`DELETE FROM anki_metadata WHERE collection = ? AND note_id = ?`);
+
+  let deleted = 0;
+  db.transaction(() => {
+    for (const noteId of noteIds) {
+      const result = stmt.run(collection, noteId);
+      deleted += result.changes;
+    }
+  })();
+
+  return deleted;
+}
+
+/**
+ * Get note IDs from the metadata table that are not in the provided set
+ * These are notes that have been deleted from Anki
+ */
+export function getDeletedAnkiNoteIds(
+  db: Database,
+  collection: string,
+  currentNoteIds: Set<number>
+): number[] {
+  const rows = db.prepare(`
+    SELECT note_id FROM anki_metadata WHERE collection = ?
+  `).all(collection) as Array<{ note_id: number }>;
+
+  return rows
+    .map(row => row.note_id)
+    .filter(noteId => !currentNoteIds.has(noteId));
+}
+
+/**
+ * Delete all Anki metadata for a collection
+ */
+export function clearAnkiMetadata(db: Database, collection: string): number {
+  const result = db.prepare(`DELETE FROM anki_metadata WHERE collection = ?`).run(collection);
+  return result.changes;
+}
+
 export { formatQueryForEmbedding, formatDocForEmbedding };
 
 export function chunkDocument(content: string, maxChars: number = CHUNK_SIZE_CHARS, overlapChars: number = CHUNK_OVERLAP_CHARS): { text: string; pos: number }[] {
@@ -1329,8 +1471,8 @@ export function getContextForFile(db: Database, filepath: string): string | null
   // Handle undefined or null filepath
   if (!filepath) return null;
 
-  // Get all collections from YAML config
-  const collections = collectionsListCollections();
+  // Get filesystem collections from YAML config (for path matching)
+  const filesystemCollections = listFilesystemCollections();
   const config = collectionsLoadConfig();
 
   // Parse virtual path format: qmd://collection/path
@@ -1343,10 +1485,7 @@ export function getContextForFile(db: Database, filepath: string): string | null
     relativePath = parsedVirtual.path;
   } else {
     // Filesystem path: find which collection this absolute path belongs to
-    for (const coll of collections) {
-      // Skip collections with missing paths
-      if (!coll || !coll.path) continue;
-
+    for (const coll of filesystemCollections) {
       if (filepath.startsWith(coll.path + '/') || filepath === coll.path) {
         collectionName = coll.name;
         // Extract relative path
@@ -1416,6 +1555,9 @@ export function getCollectionByName(db: Database, name: string): { name: string;
   const collection = getCollection(name);
   if (!collection) return null;
 
+  // Only filesystem collections have path/pattern
+  if (!isFilesystemCollection(collection)) return null;
+
   return {
     name: collection.name,
     pwd: collection.path,
@@ -1426,12 +1568,13 @@ export function getCollectionByName(db: Database, name: string): { name: string;
 /**
  * List all collections with document counts from database.
  * Merges YAML config with database statistics.
+ * Returns both filesystem and Anki collections with their stats.
  */
 export function listCollections(db: Database): { name: string; pwd: string; glob_pattern: string; doc_count: number; active_count: number; last_modified: string | null }[] {
-  const collections = collectionsListCollections();
+  const allCollections = collectionsListCollections();
 
   // Get document counts from database for each collection
-  const result = collections.map(coll => {
+  const result = allCollections.map(coll => {
     const stats = db.prepare(`
       SELECT
         COUNT(d.id) as doc_count,
@@ -1441,10 +1584,14 @@ export function listCollections(db: Database): { name: string; pwd: string; glob
       WHERE d.collection = ?
     `).get(coll.name) as { doc_count: number; active_count: number; last_modified: string | null } | null;
 
+    // For filesystem collections, use path/pattern; for Anki, use placeholders
+    const pwd = isFilesystemCollection(coll) ? coll.path : "(anki)";
+    const glob_pattern = isFilesystemCollection(coll) ? coll.pattern : "(anki)";
+
     return {
       name: coll.name,
-      pwd: coll.path,
-      glob_pattern: coll.pattern,
+      pwd,
+      glob_pattern,
       doc_count: stats?.doc_count || 0,
       active_count: stats?.active_count || 0,
       last_modified: stats?.last_modified || null,
@@ -1596,9 +1743,12 @@ export function getCollectionsWithoutContext(db: Database): { name: string; pwd:
         WHERE d.collection = ? AND d.active = 1
       `).get(coll.name) as { doc_count: number } | null;
 
+      // For filesystem collections use path; for Anki use placeholder
+      const pwd = isFilesystemCollection(coll) ? coll.path : "(anki)";
+
       collectionsWithoutContext.push({
         name: coll.name,
-        pwd: coll.path,
+        pwd,
         doc_count: stats?.doc_count || 0,
       });
     }
@@ -2075,7 +2225,7 @@ export function findDocument(db: Database, filename: string, options: { includeB
 
   // Try to match by absolute path (requires looking up collection paths from YAML)
   if (!doc && !filepath.startsWith('qmd://')) {
-    const collections = collectionsListCollections();
+    const collections = listFilesystemCollections();
     for (const coll of collections) {
       let relativePath: string | null = null;
 
@@ -2145,7 +2295,7 @@ export function getDocumentBody(db: Database, doc: DocumentResult | { filepath: 
 
   // Try absolute path by looking up in YAML collections
   if (!row) {
-    const collections = collectionsListCollections();
+    const collections = listFilesystemCollections();
     for (const coll of collections) {
       if (filepath.startsWith(coll.path + '/')) {
         const relativePath = filepath.slice(coll.path.length + 1);
@@ -2301,10 +2451,14 @@ export function getStatus(db: Database): IndexStatus {
       WHERE collection = ? AND active = 1
     `).get(col.name) as { active_count: number; last_doc_update: string | null };
 
+    // For filesystem collections use path/pattern; for Anki use placeholders
+    const path = isFilesystemCollection(col) ? col.path : "(anki)";
+    const pattern = isFilesystemCollection(col) ? col.pattern : "(anki)";
+
     return {
       name: col.name,
-      path: col.path,
-      pattern: col.pattern,
+      path,
+      pattern,
       documents: stats.active_count,
       lastUpdated: stats.last_doc_update || new Date().toISOString(),
     };

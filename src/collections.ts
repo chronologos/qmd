@@ -22,13 +22,44 @@ import YAML from "yaml";
 export type ContextMap = Record<string, string>;
 
 /**
- * A single collection configuration
+ * A filesystem-based collection (the original/default type)
  */
-export interface Collection {
+export interface FilesystemCollection {
+  source?: "filesystem";  // Optional for backward compatibility
   path: string;           // Absolute path to index
   pattern: string;        // Glob pattern (e.g., "**/*.md")
   context?: ContextMap;   // Optional context definitions
   update?: string;        // Optional bash command to run during qmd update
+}
+
+/**
+ * An Anki-based collection that indexes flashcards
+ */
+export interface AnkiCollection {
+  source: "anki";         // Required discriminant
+  decks?: string[];       // Optional deck filter (all decks if omitted)
+  note_types?: string[];  // Optional note type filter
+  tags?: string[];        // Optional tag filter (OR logic)
+  context?: ContextMap;   // Optional context definitions
+}
+
+/**
+ * A single collection configuration (discriminated union)
+ */
+export type Collection = FilesystemCollection | AnkiCollection;
+
+/**
+ * Type guard to check if a collection is filesystem-based
+ */
+export function isFilesystemCollection(c: Collection): c is FilesystemCollection {
+  return c.source !== "anki";
+}
+
+/**
+ * Type guard to check if a collection is Anki-based
+ */
+export function isAnkiCollection(c: Collection): c is AnkiCollection {
+  return c.source === "anki";
 }
 
 /**
@@ -67,9 +98,17 @@ export interface CollectionConfig {
 /**
  * Collection with its name (for return values)
  */
-export interface NamedCollection extends Collection {
-  name: string;
-}
+export type NamedCollection = Collection & { name: string };
+
+/**
+ * Named filesystem collection (for type-safe returns)
+ */
+export type NamedFilesystemCollection = FilesystemCollection & { name: string };
+
+/**
+ * Named Anki collection (for type-safe returns)
+ */
+export type NamedAnkiCollection = AnkiCollection & { name: string };
 
 // ============================================================================
 // Configuration paths
@@ -171,7 +210,21 @@ export function listCollections(): NamedCollection[] {
 }
 
 /**
- * Add or update a collection
+ * List only filesystem collections
+ */
+export function listFilesystemCollections(): NamedFilesystemCollection[] {
+  return listCollections().filter(isFilesystemCollection) as NamedFilesystemCollection[];
+}
+
+/**
+ * List only Anki collections
+ */
+export function listAnkiCollections(): NamedAnkiCollection[] {
+  return listCollections().filter(isAnkiCollection) as NamedAnkiCollection[];
+}
+
+/**
+ * Add or update a filesystem collection
  */
 export function addCollection(
   name: string,
@@ -184,8 +237,41 @@ export function addCollection(
     path,
     pattern,
     context: config.collections[name]?.context, // Preserve existing context
+  } as FilesystemCollection;
+
+  saveConfig(config);
+}
+
+/**
+ * Add or update an Anki collection
+ */
+export function addAnkiCollection(
+  name: string,
+  options: {
+    decks?: string[];
+    noteTypes?: string[];
+    tags?: string[];
+  } = {}
+): void {
+  const config = loadConfig();
+
+  const ankiCollection: AnkiCollection = {
+    source: "anki",
+    context: config.collections[name]?.context, // Preserve existing context
   };
 
+  // Only add optional fields if they have values
+  if (options.decks && options.decks.length > 0) {
+    ankiCollection.decks = options.decks;
+  }
+  if (options.noteTypes && options.noteTypes.length > 0) {
+    ankiCollection.note_types = options.noteTypes;
+  }
+  if (options.tags && options.tags.length > 0) {
+    ankiCollection.tags = options.tags;
+  }
+
+  config.collections[name] = ankiCollection;
   saveConfig(config);
 }
 

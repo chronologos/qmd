@@ -7,10 +7,13 @@ Use Bun instead of Node.js (`bun` not `node`, `bun install` not `npm install`).
 ## Commands
 
 ```sh
-qmd collection add . --name <n>   # Create/index collection
+qmd collection add . --name <n>   # Create/index filesystem collection
+qmd collection add --anki --name <n>  # Create Anki collection
 qmd collection list               # List all collections with details
 qmd collection remove <name>      # Remove a collection by name
 qmd collection rename <old> <new> # Rename a collection
+qmd anki test                     # Test AnkiConnect connection
+qmd anki decks                    # List all Anki decks
 qmd ls [collection[/path]]        # List collections or files in a collection
 qmd context add [path] "text"     # Add context for path (defaults to current dir)
 qmd context list                  # List all contexts
@@ -48,6 +51,59 @@ qmd ls mynotes
 qmd ls journals/2025
 qmd ls qmd://journals/2025
 ```
+
+## Anki Collections
+
+QMD can index Anki flashcards as searchable documents via AnkiConnect.
+
+**Prerequisites:**
+- Anki desktop running
+- AnkiConnect plugin installed (code: 2055492159)
+
+```sh
+# Test AnkiConnect connection
+qmd anki test
+
+# List all Anki decks
+qmd anki decks
+
+# Create an Anki collection (indexes all decks)
+qmd collection add --anki --name flashcards
+
+# Create with deck filter
+qmd collection add --anki --name coding --deck "Programming"
+qmd collection add --anki --name coding --deck "Programming::Rust" --deck "Programming::Go"
+
+# Create with note type filter
+qmd collection add --anki --name cloze-only --deck "Default" --note-type Cloze
+
+# Create with tag filter
+qmd collection add --anki --name thinking --tag "thinking::*"
+```
+
+**YAML Configuration:**
+
+```yaml
+collections:
+  flashcards:
+    source: anki
+    decks:                    # Optional - all decks if omitted
+      - Salience
+      - "Programming::Rust"
+    note_types:               # Optional filter
+      - Basic
+      - Cloze
+    tags:                     # Optional filter (OR logic)
+      - "thinking::*"
+```
+
+**Data Model:**
+- QMD indexes **notes**, not cards (one note can generate multiple cards)
+- Document path: `{deck}/{noteId}.anki` (e.g., `Programming/Rust/1709725571942.anki`)
+- Deck hierarchy (`::`) maps to path hierarchy (`/`)
+- The `anki_metadata` table tracks `note_id`, `mod_time`, and `hash` for incremental updates
+
+**Note:** Anki collections require Anki to be running during `qmd update`.
 
 ## Context Management
 

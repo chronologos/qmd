@@ -64,6 +64,13 @@ import {
   DEFAULT_MULTI_GET_MAX_BYTES,
   createStore,
   getDefaultDbPath,
+  // Anki metadata helpers
+  getAnkiMetadata,
+  getAllAnkiMetadata,
+  upsertAnkiMetadata,
+  deleteAnkiMetadata,
+  getDeletedAnkiNoteIds,
+  clearAnkiMetadata,
 } from "./store.js";
 import { getDefaultLlamaCpp, disposeDefaultLlamaCpp, setDefaultLLMConfig, isRemoteLLM, type RerankDocument, type Queryable, type QueryType } from "./llm.js";
 import type { RemoteLLMConfig } from "./llm-remote.js";
@@ -78,14 +85,27 @@ import {
 import {
   getCollection as getCollectionFromYaml,
   listCollections as yamlListCollections,
+  listFilesystemCollections,
+  listAnkiCollections,
+  addAnkiCollection as yamlAddAnkiCollection,
   addContext as yamlAddContext,
   removeContext as yamlRemoveContext,
   setGlobalContext,
   listAllContexts,
   getRemoteConfig,
   hasRemoteConfig,
+  isFilesystemCollection,
+  isAnkiCollection,
   type RemoteConfig,
+  type NamedAnkiCollection,
+  type NamedFilesystemCollection,
 } from "./collections.js";
+import {
+  testConnection as ankiTestConnection,
+  listDecks as ankiListDecks,
+  fetchNotesForIndexing,
+  type FetchedNote,
+} from "./anki.js";
 
 // Enable production mode - allows using default database path
 // Tests must set INDEX_PATH or use createStore() with explicit path
@@ -402,29 +422,33 @@ async function updateCollections(): Promise<void> {
   // Clear Ollama cache on update
   clearCache(db);
 
-  const collections = listCollections(db);
+  // Get collections by type from YAML
+  const filesystemCollections = listFilesystemCollections();
+  const ankiCollections = listAnkiCollections();
+  const totalCollections = filesystemCollections.length + ankiCollections.length;
 
-  if (collections.length === 0) {
+  if (totalCollections === 0) {
     console.log(`${c.dim}No collections found. Run 'qmd collection add .' to index markdown files.${c.reset}`);
     closeDb();
     return;
   }
 
   // Don't close db here - indexFiles will reuse it and close at the end
-  console.log(`${c.bold}Updating ${collections.length} collection(s)...${c.reset}\n`);
+  console.log(`${c.bold}Updating ${totalCollections} collection(s)...${c.reset}\n`);
 
-  for (let i = 0; i < collections.length; i++) {
-    const col = collections[i];
-    if (!col) continue;
-    console.log(`${c.cyan}[${i + 1}/${collections.length}]${c.reset} ${c.bold}${col.name}${c.reset} ${c.dim}(${col.glob_pattern})${c.reset}`);
+  let collectionIndex = 0;
+
+  // Update filesystem collections
+  for (const col of filesystemCollections) {
+    collectionIndex++;
+    console.log(`${c.cyan}[${collectionIndex}/${totalCollections}]${c.reset} ${c.bold}${col.name}${c.reset} ${c.dim}(${col.pattern})${c.reset}`);
 
     // Execute custom update command if specified in YAML
-    const yamlCol = getCollectionFromYaml(col.name);
-    if (yamlCol?.update) {
-      console.log(`${c.dim}    Running update command: ${yamlCol.update}${c.reset}`);
+    if (col.update) {
+      console.log(`${c.dim}    Running update command: ${col.update}${c.reset}`);
       try {
-        const proc = Bun.spawn(["/usr/bin/env", "bash", "-c", yamlCol.update], {
-          cwd: col.pwd,
+        const proc = Bun.spawn(["/usr/bin/env", "bash", "-c", col.update], {
+          cwd: col.path,
           stdout: "pipe",
           stderr: "pipe",
         });
@@ -450,7 +474,21 @@ async function updateCollections(): Promise<void> {
       }
     }
 
-    await indexFiles(col.pwd, col.glob_pattern, col.name, true);
+    await indexFiles(col.path, col.pattern, col.name, true);
+    console.log("");
+  }
+
+  // Update Anki collections
+  for (const col of ankiCollections) {
+    collectionIndex++;
+    const deckInfo = col.decks?.length ? col.decks.join(", ") : "all decks";
+    console.log(`${c.cyan}[${collectionIndex}/${totalCollections}]${c.reset} ${c.bold}${col.name}${c.reset} ${c.dim}(anki: ${deckInfo})${c.reset}`);
+
+    await indexAnkiCollection(col.name, {
+      decks: col.decks,
+      noteTypes: col.note_types,
+      tags: col.tags,
+    }, true);
     console.log("");
   }
 
@@ -475,9 +513,12 @@ function detectCollectionFromPath(db: Database, fsPath: string): { collectionNam
   // Find collections that this path is under from YAML
   const allCollections = yamlListCollections();
 
-  // Find longest matching path
+  // Find longest matching path (only filesystem collections have paths)
   let bestMatch: { name: string; path: string } | null = null;
   for (const coll of allCollections) {
+    // Only check filesystem collections (Anki collections don't have filesystem paths)
+    if (!isFilesystemCollection(coll)) continue;
+
     if (realPath.startsWith(coll.path + '/') || realPath === coll.path) {
       if (!bestMatch || coll.path.length > bestMatch.path.length) {
         bestMatch = { name: coll.name, path: coll.path };
@@ -1322,8 +1363,8 @@ async function collectionAdd(pwd: string, globPattern: string, name?: string): P
   }
 
   // Check if a collection with this pwd+glob already exists in YAML
-  const allCollections = yamlListCollections();
-  const existingPwdGlob = allCollections.find(c => c.path === pwd && c.pattern === globPattern);
+  const filesystemCols = listFilesystemCollections();
+  const existingPwdGlob = filesystemCols.find(c => c.path === pwd && c.pattern === globPattern);
 
   if (existingPwdGlob) {
     console.error(`${c.yellow}A collection already exists for this path and pattern:${c.reset}`);
@@ -1386,6 +1427,116 @@ function collectionRename(oldName: string, newName: string): void {
 
   console.log(`${c.green}✓${c.reset} Renamed collection '${oldName}' to '${newName}'`);
   console.log(`  Virtual paths updated: ${c.cyan}qmd://${oldName}/${c.reset} → ${c.cyan}qmd://${newName}/${c.reset}`);
+}
+
+// =============================================================================
+// Anki Collection Commands
+// =============================================================================
+
+/**
+ * Add a new Anki collection
+ */
+async function ankiCollectionAdd(
+  name: string,
+  options: {
+    decks?: string[];
+    noteTypes?: string[];
+    tags?: string[];
+  }
+): Promise<void> {
+  // Check if collection already exists
+  const existing = getCollectionFromYaml(name);
+  if (existing) {
+    console.error(`${c.yellow}Collection '${name}' already exists.${c.reset}`);
+    console.error(`Use a different name with --name <name>`);
+    process.exit(1);
+  }
+
+  // Test AnkiConnect connection first
+  console.log(`Testing AnkiConnect connection...`);
+  const connected = await ankiTestConnection();
+  if (!connected) {
+    console.error(`${c.yellow}Could not connect to AnkiConnect.${c.reset}`);
+    console.error(`Make sure:`);
+    console.error(`  1. Anki desktop is running`);
+    console.error(`  2. AnkiConnect plugin is installed (code: 2055492159)`);
+    console.error(`  3. AnkiConnect is listening on localhost:8765`);
+    process.exit(1);
+  }
+  console.log(`${c.green}✓${c.reset} AnkiConnect connected`);
+
+  // Validate deck names if specified
+  if (options.decks && options.decks.length > 0) {
+    const allDecks = await ankiListDecks();
+    for (const deck of options.decks) {
+      if (!allDecks.includes(deck)) {
+        console.error(`${c.yellow}Deck not found: ${deck}${c.reset}`);
+        console.error(`Available decks: ${allDecks.join(", ")}`);
+        process.exit(1);
+      }
+    }
+  }
+
+  // Add to YAML config
+  yamlAddAnkiCollection(name, {
+    decks: options.decks,
+    noteTypes: options.noteTypes,
+    tags: options.tags,
+  });
+
+  // Index the collection
+  console.log(`Creating Anki collection '${name}'...`);
+  await indexAnkiCollection(name, options);
+  console.log(`${c.green}✓${c.reset} Anki collection '${name}' created successfully`);
+}
+
+/**
+ * Test AnkiConnect connection
+ */
+async function ankiTest(): Promise<void> {
+  console.log(`${c.bold}Testing AnkiConnect connection...${c.reset}\n`);
+
+  const connected = await ankiTestConnection();
+  if (connected) {
+    console.log(`${c.green}✓${c.reset} AnkiConnect is running`);
+
+    // Show some stats
+    const decks = await ankiListDecks();
+    console.log(`  Found ${decks.length} deck(s)`);
+
+    if (decks.length > 0 && decks.length <= 10) {
+      console.log(`  Decks: ${decks.join(", ")}`);
+    } else if (decks.length > 10) {
+      console.log(`  Decks: ${decks.slice(0, 10).join(", ")} ... and ${decks.length - 10} more`);
+    }
+  } else {
+    console.error(`${c.yellow}✗${c.reset} Could not connect to AnkiConnect`);
+    console.error(`\nMake sure:`);
+    console.error(`  1. Anki desktop is running`);
+    console.error(`  2. AnkiConnect plugin is installed`);
+    console.error(`     Tools > Add-ons > Get Add-ons... > Code: 2055492159`);
+    console.error(`  3. Restart Anki after installing AnkiConnect`);
+    process.exit(1);
+  }
+}
+
+/**
+ * List all Anki decks
+ */
+async function ankiListDecksCommand(): Promise<void> {
+  const connected = await ankiTestConnection();
+  if (!connected) {
+    console.error(`${c.yellow}Could not connect to AnkiConnect.${c.reset}`);
+    console.error(`Run 'qmd anki test' for troubleshooting.`);
+    process.exit(1);
+  }
+
+  const decks = await ankiListDecks();
+  console.log(`${c.bold}Anki Decks${c.reset} (${decks.length})\n`);
+
+  for (const deck of decks.sort()) {
+    console.log(`  ${deck}`);
+  }
 }
 
 async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, collectionName?: string, suppressEmbedNotice: boolean = false): Promise<void> {
@@ -1501,6 +1652,161 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   const orphanedContent = cleanupOrphanedContent(db);
 
   // Check if vector index needs updating
+  const needsEmbedding = getHashesNeedingEmbedding(db);
+
+  progress.clear();
+  console.log(`\nIndexed: ${indexed} new, ${updated} updated, ${unchanged} unchanged, ${removed} removed`);
+  if (orphanedContent > 0) {
+    console.log(`Cleaned up ${orphanedContent} orphaned content hash(es)`);
+  }
+
+  if (needsEmbedding > 0 && !suppressEmbedNotice) {
+    console.log(`\nRun 'qmd embed' to update embeddings (${needsEmbedding} unique hashes need vectors)`);
+  }
+
+  closeDb();
+}
+
+// =============================================================================
+// Anki Collection Indexing
+// =============================================================================
+
+/**
+ * Index an Anki collection by fetching notes via AnkiConnect
+ */
+async function indexAnkiCollection(
+  collectionName: string,
+  options: {
+    decks?: string[];
+    noteTypes?: string[];
+    tags?: string[];
+  },
+  suppressEmbedNotice: boolean = false
+): Promise<void> {
+  const db = getDb();
+  const now = new Date().toISOString();
+
+  // Clear cache on index
+  clearCache(db);
+
+  console.log(`Anki collection: ${collectionName}`);
+  if (options.decks?.length) {
+    console.log(`  Decks: ${options.decks.join(", ")}`);
+  }
+  if (options.noteTypes?.length) {
+    console.log(`  Note types: ${options.noteTypes.join(", ")}`);
+  }
+  if (options.tags?.length) {
+    console.log(`  Tags: ${options.tags.join(", ")}`);
+  }
+
+  progress.indeterminate();
+
+  // Fetch notes from Anki
+  let fetchedNotes: FetchedNote[];
+  try {
+    fetchedNotes = await fetchNotesForIndexing(
+      options,
+      (msg) => process.stderr.write(`\r${msg}        `),
+    );
+  } catch (error) {
+    progress.clear();
+    if (error instanceof Error) {
+      console.error(`\n${c.yellow}Error connecting to Anki:${c.reset}`);
+      console.error(error.message);
+    }
+    closeDb();
+    return;
+  }
+
+  if (fetchedNotes.length === 0) {
+    progress.clear();
+    console.log("\nNo notes found matching criteria.");
+    closeDb();
+    return;
+  }
+
+  console.log(`\nProcessing ${fetchedNotes.length} notes...`);
+
+  // Build set of current note IDs for deletion detection
+  const currentNoteIds = new Set(fetchedNotes.map(f => f.note.noteId));
+
+  // Track stats
+  let indexed = 0, updated = 0, unchanged = 0;
+  const seenPaths = new Set<string>();
+  const startTime = Date.now();
+
+  for (let i = 0; i < fetchedNotes.length; i++) {
+    const fetched = fetchedNotes[i]!;
+    const path = handelize(fetched.path);
+    seenPaths.add(path);
+
+    const content = fetched.markdown.content;
+    const title = fetched.markdown.title;
+    const hash = await hashContent(content);
+
+    // Check Anki metadata for this note
+    const existingMeta = getAnkiMetadata(db, collectionName, fetched.note.noteId);
+
+    if (existingMeta) {
+      // Note exists - check if modified
+      if (existingMeta.modTime === fetched.note.mod && existingMeta.hash === hash) {
+        // Unchanged
+        unchanged++;
+      } else {
+        // Modified - update content and document
+        insertContent(db, hash, content, now);
+        const existing = findActiveDocument(db, collectionName, path);
+        if (existing) {
+          updateDocument(db, existing.id, title, hash, now);
+        } else {
+          insertDocument(db, collectionName, path, title, hash, now, now);
+        }
+        upsertAnkiMetadata(db, collectionName, fetched.note.noteId, fetched.note.mod, hash);
+        updated++;
+      }
+    } else {
+      // New note
+      insertContent(db, hash, content, now);
+      insertDocument(db, collectionName, path, title, hash, now, now);
+      upsertAnkiMetadata(db, collectionName, fetched.note.noteId, fetched.note.mod, hash);
+      indexed++;
+    }
+
+    // Progress update
+    const percent = ((i + 1) / fetchedNotes.length) * 100;
+    progress.set(percent);
+    const elapsed = (Date.now() - startTime) / 1000;
+    const rate = (i + 1) / elapsed;
+    const remaining = (fetchedNotes.length - i - 1) / rate;
+    const eta = i > 2 ? ` ETA: ${formatETA(remaining)}` : "";
+    process.stderr.write(`\rIndexing: ${i + 1}/${fetchedNotes.length}${eta}        `);
+  }
+
+  // Deactivate documents for notes that were deleted from Anki
+  const deletedNoteIds = getDeletedAnkiNoteIds(db, collectionName, currentNoteIds);
+  let removed = 0;
+
+  if (deletedNoteIds.length > 0) {
+    // Get paths for deleted notes from metadata
+    for (const noteId of deletedNoteIds) {
+      // Find and deactivate document
+      const allActive = getActiveDocumentPaths(db, collectionName);
+      for (const path of allActive) {
+        if (!seenPaths.has(path)) {
+          deactivateDocument(db, collectionName, path);
+          removed++;
+        }
+      }
+    }
+    // Clean up metadata for deleted notes
+    deleteAnkiMetadata(db, collectionName, deletedNoteIds);
+  }
+
+  // Clean up orphaned content
+  const orphanedContent = cleanupOrphanedContent(db);
+
+  // Check embedding status
   const needsEmbedding = getHashesNeedingEmbedding(db);
 
   progress.clear();
@@ -2503,6 +2809,11 @@ function parseCLI() {
       // Collection options
       name: { type: "string" },  // collection name
       mask: { type: "string" },  // glob pattern
+      // Anki collection options
+      anki: { type: "boolean" },  // Create Anki collection instead of filesystem
+      deck: { type: "string", multiple: true },  // Anki deck filter
+      "note-type": { type: "string", multiple: true },  // Anki note type filter
+      tag: { type: "string", multiple: true },  // Anki tag filter
       // Embed options
       force: { type: "boolean", short: "f" },
       // Update options
@@ -2767,12 +3078,31 @@ if (import.meta.main) {
         }
 
         case "add": {
-          const pwd = cli.args[1] || getPwd();
-          const resolvedPwd = pwd === '.' ? getPwd() : getRealPath(resolve(pwd));
-          const globPattern = cli.values.mask as string || DEFAULT_GLOB;
-          const name = cli.values.name as string | undefined;
+          const isAnki = cli.values.anki as boolean;
 
-          await collectionAdd(resolvedPwd, globPattern, name);
+          if (isAnki) {
+            // Anki collection
+            const name = cli.values.name as string | undefined;
+            if (!name) {
+              console.error("Usage: qmd collection add --anki --name <name> [--deck <deck>] [--note-type <type>] [--tag <tag>]");
+              console.error("  --name is required for Anki collections");
+              process.exit(1);
+            }
+
+            const decks = cli.values.deck as string[] | undefined;
+            const noteTypes = cli.values["note-type"] as string[] | undefined;
+            const tags = cli.values.tag as string[] | undefined;
+
+            await ankiCollectionAdd(name, { decks, noteTypes, tags });
+          } else {
+            // Filesystem collection
+            const pwd = cli.args[1] || getPwd();
+            const resolvedPwd = pwd === '.' ? getPwd() : getRealPath(resolve(pwd));
+            const globPattern = cli.values.mask as string || DEFAULT_GLOB;
+            const name = cli.values.name as string | undefined;
+
+            await collectionAdd(resolvedPwd, globPattern, name);
+          }
           break;
         }
 
@@ -2801,6 +3131,27 @@ if (import.meta.main) {
         default:
           console.error(`Unknown subcommand: ${subcommand}`);
           console.error("Available: list, add, remove, rename");
+          process.exit(1);
+      }
+      break;
+    }
+
+    case "anki": {
+      const subcommand = cli.args[0];
+      switch (subcommand) {
+        case "test": {
+          await ankiTest();
+          break;
+        }
+
+        case "decks": {
+          await ankiListDecksCommand();
+          break;
+        }
+
+        default:
+          console.error(`Unknown subcommand: ${subcommand || "(none)"}`);
+          console.error("Available: test, decks");
           process.exit(1);
       }
       break;
