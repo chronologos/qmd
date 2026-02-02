@@ -1,5 +1,7 @@
 # QMD - Query Markup Documents
 
+This is a fork of [tobi/qmd](https://github.com/tobi/qmd) with remote LLM support. See [MERGE_UPSTREAM.md](MERGE_UPSTREAM.md) for syncing upstream changes.
+
 Use Bun instead of Node.js (`bun` not `node`, `bun install` not `npm install`).
 
 ## Commands

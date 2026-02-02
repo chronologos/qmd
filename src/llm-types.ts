@@ -181,13 +181,81 @@ export interface LLM {
 // =============================================================================
 
 /**
+ * Options for parseQueryables
+ */
+export type ParseQueryablesOptions = {
+  /** Include lex (lexical) queries in output (default: true) */
+  includeLexical?: boolean;
+  /**
+   * Original query for term validation.
+   * When provided, filters out expanded queries that don't contain
+   * at least one term from the original query (guards against hallucinations).
+   */
+  originalQuery?: string;
+};
+
+/**
+ * Extract alphanumeric terms from a query string for validation.
+ */
+function extractQueryTerms(query: string): string[] {
+  return query
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .filter(Boolean);
+}
+
+/**
+ * Check if text contains at least one term from the original query.
+ * Returns true if no terms provided (no validation needed).
+ */
+function hasQueryTerm(text: string, terms: string[]): boolean {
+  if (terms.length === 0) return true;
+  const lower = text.toLowerCase();
+  return terms.some((term) => lower.includes(term));
+}
+
+/**
+ * Create fallback queryables when parsing fails or returns nothing useful.
+ * Returns: hyde, lex (if requested), vec - all using the original query.
+ */
+export function createFallbackQueryables(
+  query: string,
+  includeLexical: boolean
+): Queryable[] {
+  const fallback: Queryable[] = [
+    { type: "hyde", text: `Information about ${query}` },
+    { type: "vec", text: query },
+  ];
+  if (includeLexical) {
+    fallback.splice(1, 0, { type: "lex", text: query });
+  }
+  return fallback;
+}
+
+/**
  * Parse and limit queryables from raw text output.
  * Deduplicates by text content and limits to max 3 lex, 3 vec, 1 hyde.
+ *
+ * When `originalQuery` is provided, validates that each parsed queryable
+ * contains at least one term from the original query (filters hallucinations).
+ *
+ * Returns an empty array if no valid queryables are found - caller should
+ * use createFallbackQueryables() to generate sensible defaults.
  */
 export function parseQueryables(
   rawText: string,
-  includeLexical: boolean
+  options?: ParseQueryablesOptions | boolean
 ): Queryable[] {
+  // Support legacy signature: parseQueryables(text, includeLexical)
+  const opts: ParseQueryablesOptions =
+    typeof options === "boolean" ? { includeLexical: options } : options ?? {};
+
+  const includeLexical = opts.includeLexical ?? true;
+  const queryTerms = opts.originalQuery
+    ? extractQueryTerms(opts.originalQuery)
+    : [];
+
   const lines = rawText.trim().split("\n");
   const seen = new Set<string>();
   const lex: Queryable[] = [];
@@ -203,6 +271,10 @@ export function parseQueryables(
 
     const text = line.slice(colonIdx + 1).trim();
     if (!text || seen.has(text)) continue;
+
+    // Validate against original query terms if provided
+    if (queryTerms.length > 0 && !hasQueryTerm(text, queryTerms)) continue;
+
     seen.add(text);
 
     const q: Queryable = { type: type as QueryType, text };

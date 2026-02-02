@@ -458,8 +458,10 @@ describe("LLM Integration", () => {
 // =============================================================================
 
 describe("LLM Session Management", () => {
+  // Session management only works with local LlamaCpp, not remote LLM
   describe("withLLMSession", () => {
     test("session provides access to LLM operations", async () => {
+      if (shouldUseRemoteLLM()) return; // Sessions not supported for remote
       const result = await withLLMSession(async (session) => {
         expect(session.isValid).toBe(true);
         const embedding = await session.embed("test text");
@@ -471,6 +473,7 @@ describe("LLM Session Management", () => {
     });
 
     test("session is invalid after release", async () => {
+      if (shouldUseRemoteLLM()) return;
       let capturedSession: ILLMSession | null = null;
 
       await withLLMSession(async (session) => {
@@ -484,6 +487,7 @@ describe("LLM Session Management", () => {
     });
 
     test("session prevents idle unload during operations", async () => {
+      if (shouldUseRemoteLLM()) return;
       await withLLMSession(async (session) => {
         // While inside a session, canUnloadLLM should return false
         expect(canUnloadLLM()).toBe(false);
@@ -500,6 +504,7 @@ describe("LLM Session Management", () => {
     });
 
     test("nested sessions increment ref count", async () => {
+      if (shouldUseRemoteLLM()) return;
       await withLLMSession(async (outerSession) => {
         expect(canUnloadLLM()).toBe(false);
 
@@ -519,6 +524,7 @@ describe("LLM Session Management", () => {
     });
 
     test("session embedBatch works correctly", async () => {
+      if (shouldUseRemoteLLM()) return;
       await withLLMSession(async (session) => {
         const texts = ["Hello world", "Test text", "Another document"];
         const results = await session.embedBatch(texts);
@@ -532,6 +538,7 @@ describe("LLM Session Management", () => {
     });
 
     test("session rerank works correctly", async () => {
+      if (shouldUseRemoteLLM()) return;
       await withLLMSession(async (session) => {
         const documents: RerankDocument[] = [
           { file: "a.txt", text: "The capital of France is Paris." },
@@ -547,6 +554,7 @@ describe("LLM Session Management", () => {
     });
 
     test("max duration aborts session after timeout", async () => {
+      if (shouldUseRemoteLLM()) return;
       let aborted = false;
 
       try {
@@ -569,6 +577,7 @@ describe("LLM Session Management", () => {
     }, 5000);
 
     test("external abort signal propagates to session", async () => {
+      if (shouldUseRemoteLLM()) return;
       const abortController = new AbortController();
       let sessionAborted = false;
 
@@ -597,6 +606,7 @@ describe("LLM Session Management", () => {
     }, 5000);
 
     test("session provides abort signal for monitoring", async () => {
+      if (shouldUseRemoteLLM()) return;
       await withLLMSession(async (session) => {
         expect(session.signal).toBeInstanceOf(AbortSignal);
         expect(session.signal.aborted).toBe(false);
@@ -604,6 +614,7 @@ describe("LLM Session Management", () => {
     });
 
     test("returns value from callback", async () => {
+      if (shouldUseRemoteLLM()) return;
       const result = await withLLMSession(async (session) => {
         await session.embed("test");
         return { status: "complete", count: 42 };
@@ -613,6 +624,7 @@ describe("LLM Session Management", () => {
     });
 
     test("propagates errors from callback", async () => {
+      if (shouldUseRemoteLLM()) return;
       const customError = new Error("Custom test error");
 
       await expect(

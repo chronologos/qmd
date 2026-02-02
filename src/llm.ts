@@ -37,7 +37,9 @@ export {
   type Queryable,
   type RerankDocument,
   type LLM,
+  type ParseQueryablesOptions,
   parseQueryables,
+  createFallbackQueryables,
   formatQueryForEmbedding,
   formatDocForEmbedding,
 } from "./llm-types.js";
@@ -55,7 +57,7 @@ import type {
   RerankDocument,
   Queryable,
 } from "./llm-types.js";
-import { parseQueryables } from "./llm-types.js";
+import { parseQueryables, createFallbackQueryables } from "./llm-types.js";
 
 // Session types from upstream (lifecycle management)
 /**
@@ -706,14 +708,16 @@ export class LlamaCpp implements LLM {
         },
       });
 
-      // Use shared parser with deduplication and limits
-      return parseQueryables(result, includeLexical);
+      // Use shared parser with deduplication, limits, and term validation
+      const parsed = parseQueryables(result, {
+        includeLexical,
+        originalQuery: query,
+      });
+      // Return fallback if parsing yielded nothing useful
+      return parsed.length > 0 ? parsed : createFallbackQueryables(query, includeLexical);
     } catch (error) {
       console.error("Structured query expansion failed:", error);
-      // Fallback to original query
-      const fallback: Queryable[] = [{ type: 'vec', text: query }];
-      if (includeLexical) fallback.unshift({ type: 'lex', text: query });
-      return fallback;
+      return createFallbackQueryables(query, includeLexical);
     } finally {
       await genContext.dispose();
     }

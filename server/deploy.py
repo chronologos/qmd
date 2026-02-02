@@ -1,19 +1,32 @@
 #!/usr/bin/env python3
 """
-QMD Embed/Rerank server deployment script.
-Deploys the embed/rerank service managed by systemd, accessible via Tailscale.
+QMD server deployment script.
+Deploys both vLLM (query expansion) and embed/rerank services.
 
 Usage:
-    sudo python3 deploy.py              # Initial deploy
-    sudo python3 deploy.py --restart    # Restart without rebuilding
-    sudo python3 deploy.py --stop       # Stop the service
-    sudo python3 deploy.py --status     # Show service status
-    sudo python3 deploy.py --logs       # Show service logs
+    sudo python3 deploy.py              # Deploy all services
+    sudo python3 deploy.py --status     # Show status of all services
+    sudo python3 deploy.py --logs       # Show embed/rerank logs
+    sudo python3 deploy.py --restart    # Restart all services
+    sudo python3 deploy.py --stop       # Stop all services
+
+    # Individual service control
+    sudo python3 deploy.py vllm --status
+    sudo python3 deploy.py vllm --logs
+    sudo python3 deploy.py vllm --restart
+    sudo python3 deploy.py vllm --model "Qwen/Qwen3-8B"
+
+    sudo python3 deploy.py embed --status
+    sudo python3 deploy.py embed --logs
+    sudo python3 deploy.py embed --restart
 
 Prerequisites:
-    1. Create Tailscale Service "qmd-embed" in admin console:
+    1. Create Tailscale Services in admin console:
        https://login.tailscale.com/admin/services
-    2. Set endpoint to tcp:443
+       - "qmd-embed" with endpoint tcp:443
+       - "qmd-vllm" with endpoint tcp:443
+    2. Docker installed and running
+    3. Virtual environment set up: uv venv && uv pip install -r requirements.txt
 """
 
 import argparse
@@ -23,42 +36,200 @@ import subprocess
 import sys
 from pathlib import Path
 
+# =============================================================================
 # Configuration
+# =============================================================================
+
 DEPLOY_DIR = Path(__file__).parent.resolve()
 VENV_DIR = DEPLOY_DIR / ".venv"
-SERVICE_NAME = "qmd-embed"
-SERVICE_FILE = Path(f"/etc/systemd/system/{SERVICE_NAME}.service")
-LOCAL_PORT = 8001
 
+# Embed/Rerank service config
+EMBED_SERVICE_NAME = "qmd-embed"
+EMBED_SERVICE_FILE = Path(f"/etc/systemd/system/{EMBED_SERVICE_NAME}.service")
+EMBED_PORT = 8001
+
+# vLLM container config
+VLLM_CONTAINER_NAME = "qmd-vllm"
+VLLM_IMAGE = "nvcr.io/nvidia/vllm:25.12.post1-py3"
+VLLM_PORT = 8000
+VLLM_DEFAULT_MODEL = "tobil/qmd-query-expansion-1.7B"
+VLLM_GPU_MEMORY_UTILIZATION = 0.5  # 1.7B model needs less memory than 8B
+
+
+# =============================================================================
+# Utilities
+# =============================================================================
 
 def run(cmd: list[str], check: bool = True, capture: bool = False) -> subprocess.CompletedProcess:
     """Run a command and return the result."""
     print(f"  $ {' '.join(cmd)}")
-    return subprocess.run(
-        cmd,
-        check=check,
-        capture_output=capture,
-        text=True,
-    )
+    return subprocess.run(cmd, check=check, capture_output=capture, text=True)
 
 
-def check_prerequisites() -> None:
-    """Verify all prerequisites are met."""
-    print("\n[1/5] Checking prerequisites...")
-
-    # Check running as root (needed for systemd)
+def require_root() -> None:
+    """Exit if not running as root."""
     if os.geteuid() != 0:
-        print("Error: This script must be run with sudo")
+        print("Error: This command must be run with sudo")
         sys.exit(1)
-    print("  - Running as root: OK")
 
-    # Check Tailscale
-    result = run(["tailscale", "status"], check=False, capture=True)
+
+def get_tailnet_suffix() -> str:
+    """Get the tailnet suffix from tailscale status."""
+    result = run(["tailscale", "status", "--json"], capture=True)
+    status = json.loads(result.stdout)
+    dns_name = status.get("Self", {}).get("DNSName", "").rstrip(".")
+    parts = dns_name.split(".")
+    if len(parts) >= 3:
+        return "." + ".".join(parts[1:])
+    return ""
+
+
+def setup_tailscale_serve(service_name: str, port: int) -> str:
+    """Configure Tailscale Serve for a service. Returns the full service URL."""
+    print(f"\n[{service_name}] Configuring Tailscale Serve...")
+    run([
+        "tailscale", "serve",
+        "--service", f"svc:{service_name}",
+        "--bg", "--https=443",
+        f"127.0.0.1:{port}"
+    ])
+    print(f"  - Tailscale Serve configured ({service_name} service)")
+    return f"{service_name}{get_tailnet_suffix()}"
+
+
+# =============================================================================
+# vLLM Docker Container Management
+# =============================================================================
+
+def check_docker() -> None:
+    """Verify docker is available."""
+    result = run(["docker", "info"], check=False, capture=True)
     if result.returncode != 0:
-        print("Error: Tailscale is not connected")
+        print("Error: Docker is not running or not accessible")
         sys.exit(1)
-    print("  - Tailscale: OK")
+    print("  - Docker: OK")
 
+
+def get_vllm_container_info() -> dict | None:
+    """Get info about the vLLM container if it exists."""
+    result = run(
+        ["docker", "inspect", VLLM_CONTAINER_NAME],
+        check=False,
+        capture=True,
+    )
+    if result.returncode != 0:
+        return None
+    return json.loads(result.stdout)[0]
+
+
+def get_current_vllm_model() -> str | None:
+    """Get the model currently being served by the vLLM container."""
+    info = get_vllm_container_info()
+    if not info:
+        return None
+    # Parse the command to find the model argument
+    cmd = info.get("Config", {}).get("Cmd", [])
+    for i, arg in enumerate(cmd):
+        if arg == "serve" and i + 1 < len(cmd):
+            return cmd[i + 1]
+    return None
+
+
+def deploy_vllm(model: str | None = None, force: bool = False) -> None:
+    """Deploy the vLLM container."""
+    model = model or VLLM_DEFAULT_MODEL
+    print(f"\n[vLLM] Deploying container with model: {model}")
+
+    current_model = get_current_vllm_model()
+    container_exists = current_model is not None
+
+    if container_exists and current_model == model and not force:
+        print(f"  - Container already running with {model}")
+        # Just ensure it's started
+        run(["docker", "start", VLLM_CONTAINER_NAME], check=False)
+        return
+
+    # Stop and remove existing container if model changed or force
+    if container_exists:
+        if current_model != model:
+            print(f"  - Model changed: {current_model} -> {model}")
+        print("  - Removing existing container...")
+        run(["docker", "stop", VLLM_CONTAINER_NAME], check=False)
+        run(["docker", "rm", VLLM_CONTAINER_NAME], check=False)
+
+    # Create new container
+    print("  - Creating new container...")
+    run([
+        "docker", "run", "-d",
+        "--name", VLLM_CONTAINER_NAME,
+        "--gpus", "all",
+        "--ipc=host",
+        "--ulimit", "memlock=-1",
+        "--ulimit", "stack=67108864",
+        "-p", f"127.0.0.1:{VLLM_PORT}:{VLLM_PORT}",
+        "-v", f"{Path.home()}/.cache/huggingface:/root/.cache/huggingface",
+        VLLM_IMAGE,
+        "vllm", "serve", model,
+        "--gpu-memory-utilization", str(VLLM_GPU_MEMORY_UTILIZATION),
+        "--port", str(VLLM_PORT),
+    ])
+    print(f"  - Container '{VLLM_CONTAINER_NAME}' created and started")
+
+
+def stop_vllm() -> None:
+    """Stop the vLLM container."""
+    print("\n[vLLM] Stopping container...")
+    run(["docker", "stop", VLLM_CONTAINER_NAME], check=False)
+    print("  - Container stopped")
+
+
+def show_vllm_status() -> None:
+    """Show vLLM container status."""
+    print("\n[vLLM Container Status]")
+    info = get_vllm_container_info()
+    if not info:
+        print("  Container does not exist")
+        return
+
+    state = info.get("State", {})
+    config = info.get("Config", {})
+
+    print(f"  Name: {VLLM_CONTAINER_NAME}")
+    print(f"  Status: {state.get('Status', 'unknown')}")
+    print(f"  Running: {state.get('Running', False)}")
+    print(f"  Model: {get_current_vllm_model()}")
+    print(f"  Image: {config.get('Image', 'unknown')}")
+
+    if state.get("Running"):
+        # Check if the API is responding
+        result = run(
+            ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+             f"http://127.0.0.1:{VLLM_PORT}/health"],
+            check=False, capture=True
+        )
+        api_status = "healthy" if result.stdout.strip() == "200" else "starting/unhealthy"
+        print(f"  API: {api_status}")
+
+
+def show_vllm_logs(follow: bool = True) -> None:
+    """Show vLLM container logs."""
+    cmd = ["docker", "logs", VLLM_CONTAINER_NAME]
+    if follow:
+        cmd.append("-f")
+    run(cmd, check=False)
+
+
+def setup_vllm_tailscale() -> str:
+    """Configure Tailscale Serve for vLLM."""
+    return setup_tailscale_serve(VLLM_CONTAINER_NAME, VLLM_PORT)
+
+
+# =============================================================================
+# Embed/Rerank Service Management
+# =============================================================================
+
+def check_embed_prerequisites() -> None:
+    """Verify embed/rerank prerequisites."""
     # Check virtual environment exists
     if not (VENV_DIR / "bin" / "uvicorn").exists():
         print(f"Error: Virtual environment not found at {VENV_DIR}")
@@ -73,23 +244,11 @@ def check_prerequisites() -> None:
     print("  - embed_rerank.py: OK")
 
 
-def get_tailscale_ip() -> str:
-    """Get the Tailscale IPv4 address."""
-    print("\n[2/5] Getting Tailscale IP...")
-    result = run(["tailscale", "ip", "-4"], capture=True)
-    ip = result.stdout.strip()
-    print(f"  - Tailscale IP: {ip}")
-    return ip
+def create_embed_systemd_service() -> None:
+    """Create the systemd service file for embed/rerank."""
+    print("\n[Embed] Creating systemd service...")
 
-
-def create_systemd_service() -> None:
-    """Create the systemd service file."""
-    print("\n[3/5] Creating systemd service...")
-
-    # Get the real user who ran sudo (for HOME directory)
     sudo_user = os.environ.get("SUDO_USER", "root")
-    sudo_uid = os.environ.get("SUDO_UID", "0")
-    sudo_gid = os.environ.get("SUDO_GID", "0")
 
     service_content = f"""[Unit]
 Description=QMD Embed/Rerank Server
@@ -107,112 +266,215 @@ Environment="PATH={VENV_DIR}/bin:/usr/local/bin:/usr/bin:/bin"
 Environment="MAX_BATCH_SIZE=64"
 
 # Start uvicorn
-ExecStart={VENV_DIR}/bin/uvicorn embed_rerank:app --host 127.0.0.1 --port {LOCAL_PORT}
+ExecStart={VENV_DIR}/bin/uvicorn embed_rerank:app --host 127.0.0.1 --port {EMBED_PORT}
 
 [Install]
 WantedBy=multi-user.target
 """
 
-    with open(SERVICE_FILE, "w") as f:
+    with open(EMBED_SERVICE_FILE, "w") as f:
         f.write(service_content)
-    print(f"  - Service file written to {SERVICE_FILE}")
+    print(f"  - Service file written to {EMBED_SERVICE_FILE}")
 
-    # Reload systemd
     run(["systemctl", "daemon-reload"])
     print("  - systemd daemon reloaded")
 
 
-def enable_and_start() -> None:
-    """Enable and start the systemd service."""
-    print("\n[4/5] Enabling and starting service...")
+def deploy_embed() -> None:
+    """Deploy the embed/rerank service."""
+    print("\n[Embed] Deploying service...")
+    run(["systemctl", "enable", EMBED_SERVICE_NAME])
+    print(f"  - Service '{EMBED_SERVICE_NAME}' enabled")
 
-    run(["systemctl", "enable", SERVICE_NAME])
-    print(f"  - Service '{SERVICE_NAME}' enabled")
-
-    run(["systemctl", "restart", SERVICE_NAME])
-    print(f"  - Service '{SERVICE_NAME}' started")
-
-
-def setup_tailscale_serve() -> str:
-    """Configure Tailscale Serve for HTTPS termination.
-
-    Prerequisites:
-    - Create a Tailscale Service named "qmd-embed" in admin console
-    - Set endpoint to tcp:443
-    """
-    print("\n[5/5] Configuring Tailscale Serve...")
-
-    # Set up tailscale serve with dedicated service hostname
-    run(["tailscale", "serve", "--service", f"svc:{SERVICE_NAME}", "--bg", "--https=443", f"127.0.0.1:{LOCAL_PORT}"])
-    print(f"  - Tailscale Serve configured ({SERVICE_NAME} service, HTTPS:443 -> localhost:{LOCAL_PORT})")
-
-    # Get the tailnet name from tailscale status
-    result = run(["tailscale", "status", "--json"], capture=True)
-    status = json.loads(result.stdout)
-    dns_name = status.get("Self", {}).get("DNSName", "").rstrip(".")
-    # Extract tailnet from machine DNS name and construct service URL
-    parts = dns_name.split(".")
-    if len(parts) >= 3:
-        tailnet = ".".join(parts[1:])
-        return f"{SERVICE_NAME}.{tailnet}"
-    return dns_name
+    run(["systemctl", "restart", EMBED_SERVICE_NAME])
+    print(f"  - Service '{EMBED_SERVICE_NAME}' started")
 
 
-def show_status() -> None:
-    """Show the service status."""
-    run(["systemctl", "status", SERVICE_NAME, "--no-pager"], check=False)
+def stop_embed() -> None:
+    """Stop the embed/rerank service."""
+    print("\n[Embed] Stopping service...")
+    run(["systemctl", "stop", EMBED_SERVICE_NAME])
+    print("  - Service stopped")
 
 
-def show_logs() -> None:
-    """Show service logs."""
-    run(["journalctl", "-u", SERVICE_NAME, "-f", "--no-pager"], check=False)
+def show_embed_status() -> None:
+    """Show embed/rerank service status."""
+    print("\n[Embed/Rerank Service Status]")
+    run(["systemctl", "status", EMBED_SERVICE_NAME, "--no-pager"], check=False)
 
 
-def stop_service() -> None:
-    """Stop the service."""
-    print("Stopping service...")
-    run(["systemctl", "stop", SERVICE_NAME])
-    print("Service stopped")
+def show_embed_logs(follow: bool = True) -> None:
+    """Show embed/rerank service logs."""
+    cmd = ["journalctl", "-u", EMBED_SERVICE_NAME, "--no-pager"]
+    if follow:
+        cmd.append("-f")
+    run(cmd, check=False)
+
+
+def setup_embed_tailscale() -> str:
+    """Configure Tailscale Serve for embed/rerank."""
+    return setup_tailscale_serve(EMBED_SERVICE_NAME, EMBED_PORT)
+
+
+# =============================================================================
+# Combined Operations
+# =============================================================================
+
+def check_all_prerequisites() -> None:
+    """Check all prerequisites."""
+    print("\n[Prerequisites]")
+
+    # Check running as root (needed for systemd)
+    if os.geteuid() != 0:
+        print("Error: This script must be run with sudo")
+        sys.exit(1)
+    print("  - Running as root: OK")
+
+    # Check Tailscale
+    result = run(["tailscale", "status"], check=False, capture=True)
+    if result.returncode != 0:
+        print("Error: Tailscale is not connected")
+        sys.exit(1)
+    print("  - Tailscale: OK")
+
+    # Check Docker
+    check_docker()
+
+    # Check embed prerequisites
+    check_embed_prerequisites()
+
+
+def deploy_all(vllm_model: str | None = None) -> None:
+    """Deploy all services."""
+    check_all_prerequisites()
+
+    # Deploy vLLM
+    deploy_vllm(model=vllm_model)
+    vllm_url = setup_vllm_tailscale()
+
+    # Deploy embed/rerank
+    create_embed_systemd_service()
+    deploy_embed()
+    embed_url = setup_embed_tailscale()
+
+    # Print summary
+    print("\n" + "=" * 60)
+    print("Deployment complete!")
+    print("=" * 60)
+    print(f"\nvLLM (query expansion): https://{vllm_url}")
+    print(f"Embed/Rerank:           https://{embed_url}")
+    print("\nTest endpoints:")
+    print(f"  curl https://{vllm_url}/health")
+    print(f"  curl https://{embed_url}/health")
+    print("\nUseful commands:")
+    print(f"  sudo python3 {__file__} --status   # Check all services")
+    print(f"  sudo python3 {__file__} vllm --logs    # vLLM logs")
+    print(f"  sudo python3 {__file__} embed --logs   # Embed logs")
+
+
+def show_all_status() -> None:
+    """Show status of all services."""
+    show_vllm_status()
+    show_embed_status()
+
+
+def stop_all() -> None:
+    """Stop all services."""
+    stop_vllm()
+    stop_embed()
+
+
+def restart_all(vllm_model: str | None = None) -> None:
+    """Restart all services."""
+    print("Restarting all services...")
+    deploy_vllm(model=vllm_model, force=True)
+    run(["systemctl", "restart", EMBED_SERVICE_NAME])
+    print("All services restarted")
+
+
+# =============================================================================
+# CLI
+# =============================================================================
+
+def add_service_args(parser: argparse.ArgumentParser) -> None:
+    """Add common service management arguments to a parser."""
+    parser.add_argument("--status", action="store_true", help="Show service status")
+    parser.add_argument("--logs", action="store_true", help="Show service logs")
+    parser.add_argument("--restart", action="store_true", help="Restart service")
+    parser.add_argument("--stop", action="store_true", help="Stop service")
+
+
+def restart_embed() -> None:
+    """Restart the embed/rerank service."""
+    require_root()
+    run(["systemctl", "restart", EMBED_SERVICE_NAME])
+    print("Embed service restarted")
+
+
+def handle_service_command(
+    args: argparse.Namespace,
+    show_status: callable,
+    show_logs: callable,
+    stop: callable,
+    restart: callable,
+) -> None:
+    """Handle common service subcommand dispatch."""
+    if args.status:
+        show_status()
+    elif args.logs:
+        show_logs()
+    elif args.stop:
+        stop()
+    elif args.restart:
+        restart()
+    else:
+        show_status()
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Deploy QMD Embed/Rerank server")
-    parser.add_argument("--restart", action="store_true", help="Restart the service")
-    parser.add_argument("--stop", action="store_true", help="Stop the service")
-    parser.add_argument("--status", action="store_true", help="Show service status")
-    parser.add_argument("--logs", action="store_true", help="Show service logs")
+    parser = argparse.ArgumentParser(
+        description="Deploy QMD server (vLLM + embed/rerank)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    add_service_args(parser)
+    parser.add_argument("--model", type=str, help=f"vLLM model (default: {VLLM_DEFAULT_MODEL})")
+
+    subparsers = parser.add_subparsers(dest="service", help="Individual service commands")
+
+    vllm_parser = subparsers.add_parser("vllm", help="vLLM container management")
+    add_service_args(vllm_parser)
+    vllm_parser.add_argument("--model", type=str, help="Model to serve")
+
+    embed_parser = subparsers.add_parser("embed", help="Embed/rerank service management")
+    add_service_args(embed_parser)
+
     args = parser.parse_args()
 
-    # Handle simple commands
+    if args.service == "vllm":
+        # vLLM has special handling for --model flag
+        if args.restart or args.model:
+            require_root()
+            deploy_vllm(model=args.model, force=args.restart)
+        else:
+            handle_service_command(args, show_vllm_status, show_vllm_logs, stop_vllm, lambda: None)
+        return
+
+    if args.service == "embed":
+        handle_service_command(args, show_embed_status, show_embed_logs, stop_embed, restart_embed)
+        return
+
+    # Global commands (no subcommand specified)
     if args.status:
-        show_status()
-        return
-    if args.logs:
-        show_logs()
-        return
-    if args.stop:
-        stop_service()
-        return
-
-    # Full deploy or restart
-    check_prerequisites()
-    get_tailscale_ip()
-    create_systemd_service()
-    enable_and_start()
-    dns_name = setup_tailscale_serve()
-
-    print("\n" + "=" * 50)
-    print("Deployment complete!")
-    print("=" * 50)
-    print(f"\nQMD Embed/Rerank server is now accessible at: https://{dns_name}")
-    print("\nTest endpoints:")
-    print(f"  curl https://{dns_name}/health")
-    print(f"  curl -X POST https://{dns_name}/v1/embeddings -H 'Content-Type: application/json' -d '{{\"input\": [\"test\"]}}'")
-    print("\nUseful commands:")
-    print(f"  sudo python3 {__file__} --status   # Check status")
-    print(f"  sudo python3 {__file__} --logs     # View logs")
-    print(f"  sudo python3 {__file__} --restart  # Restart service")
-    print(f"  tailscale serve status             # Check Tailscale Serve config")
+        show_all_status()
+    elif args.logs:
+        show_embed_logs()
+    elif args.stop:
+        stop_all()
+    elif args.restart:
+        require_root()
+        restart_all(vllm_model=args.model)
+    else:
+        deploy_all(vllm_model=args.model)
 
 
 if __name__ == "__main__":

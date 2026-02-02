@@ -12,6 +12,7 @@
 
 import {
   parseQueryables,
+  createFallbackQueryables,
   type LLM,
   type EmbedOptions,
   type EmbeddingResult,
@@ -369,20 +370,19 @@ Output:`;
       });
 
       if (!result?.text) {
-        // Fallback
-        const fallback: Queryable[] = [{ type: "vec", text: query }];
-        if (includeLexical) fallback.unshift({ type: "lex", text: query });
-        return fallback;
+        return createFallbackQueryables(query, includeLexical);
       }
 
-      // Use shared parser with deduplication and limits
-      return parseQueryables(result.text, includeLexical);
+      // Use shared parser with deduplication, limits, and term validation
+      const parsed = parseQueryables(result.text, {
+        includeLexical,
+        originalQuery: query,
+      });
+      // Return fallback if parsing yielded nothing useful
+      return parsed.length > 0 ? parsed : createFallbackQueryables(query, includeLexical);
     } catch (error) {
       console.error("Remote query expansion failed:", error);
-      // Fallback to original query
-      const fallback: Queryable[] = [{ type: "vec", text: query }];
-      if (includeLexical) fallback.unshift({ type: "lex", text: query });
-      return fallback;
+      return createFallbackQueryables(query, includeLexical);
     }
   }
 

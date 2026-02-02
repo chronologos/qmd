@@ -10,6 +10,7 @@ texts/
 *.md
 !README.md
 !CLAUDE.md
+!MERGE_UPSTREAM.md
 !FLOW.md
 !MODELS.md
 !skills/**/*.md
