@@ -53,8 +53,8 @@ EMBED_PORT = 8001
 VLLM_CONTAINER_NAME = "qmd-vllm"
 VLLM_IMAGE = "nvcr.io/nvidia/vllm:25.12.post1-py3"
 VLLM_PORT = 8000
-VLLM_DEFAULT_MODEL = "tobil/qmd-query-expansion-1.7B"
-VLLM_GPU_MEMORY_UTILIZATION = 0.5  # 1.7B model needs less memory than 8B
+VLLM_DEFAULT_MODEL = "Qwen/Qwen3-8B"
+VLLM_GPU_MEMORY_UTILIZATION = 0.3  # Leave room for embed/rerank on same GPU
 
 
 # =============================================================================
@@ -167,6 +167,7 @@ def deploy_vllm(model: str | None = None, force: bool = False) -> None:
         "--ipc=host",
         "--ulimit", "memlock=-1",
         "--ulimit", "stack=67108864",
+        "-e", "NVIDIA_DISABLE_REQUIRE=1",  # Enable CUDA forward compatibility
         "-p", f"127.0.0.1:{VLLM_PORT}:{VLLM_PORT}",
         "-v", f"{Path.home()}/.cache/huggingface:/root/.cache/huggingface",
         VLLM_IMAGE,
