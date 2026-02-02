@@ -34,6 +34,7 @@ import json
 import os
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 # =============================================================================
@@ -324,10 +325,7 @@ def check_all_prerequisites() -> None:
     """Check all prerequisites."""
     print("\n[Prerequisites]")
 
-    # Check running as root (needed for systemd)
-    if os.geteuid() != 0:
-        print("Error: This script must be run with sudo")
-        sys.exit(1)
+    require_root()
     print("  - Running as root: OK")
 
     # Check Tailscale
@@ -413,10 +411,10 @@ def restart_embed() -> None:
 
 def handle_service_command(
     args: argparse.Namespace,
-    show_status: callable,
-    show_logs: callable,
-    stop: callable,
-    restart: callable,
+    show_status: Callable[[], None],
+    show_logs: Callable[[], None],
+    stop: Callable[[], None],
+    restart: Callable[[], None],
 ) -> None:
     """Handle common service subcommand dispatch."""
     if args.status:
