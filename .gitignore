@@ -12,3 +12,7 @@ texts/
 !CLAUDE.md
 !FLOW.md
 !MODELS.md
+!skills/**/*.md
+!finetune/*.md
+finetune/outputs/
+finetune/data/train/
