@@ -4,7 +4,8 @@
       "Bash(bun run tsc:*)",
       "Skill(jj-vcs)",
       "Bash(bun test:*)",
-      "Bash(QMD_TEST_REMOTE=1 bun test:*)"
+      "Bash(QMD_TEST_REMOTE=1 bun test:*)",
+      "Bash(bun src/qmd.ts:*)"
     ]
   },
   "enableAllProjectMcpServers": true,

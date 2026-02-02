@@ -1055,13 +1055,54 @@ export async function withLLMSession<T>(
   fn: (session: ILLMSession) => Promise<T>,
   options?: LLMSessionOptions
 ): Promise<T> {
-  const manager = getSessionManager();
-  const session = new LLMSession(manager, options);
+  // For local LlamaCpp, use full session management with idle unload coordination
+  if (!isRemoteLLM()) {
+    const manager = getSessionManager();
+    const session = new LLMSession(manager, options);
+    try {
+      return await fn(session);
+    } finally {
+      session.release();
+    }
+  }
+
+  // For remote LLM, create a lightweight wrapper that delegates directly
+  // (no session management needed - remote server handles its own lifecycle)
+  const llm = getDefaultLlamaCpp();
+  const abortController = new AbortController();
+
+  // Link external abort signal (forward reason for proper error messages)
+  if (options?.signal) {
+    if (options.signal.aborted) {
+      abortController.abort(options.signal.reason);
+    } else {
+      options.signal.addEventListener(
+        "abort",
+        () => abortController.abort(options.signal!.reason),
+        { once: true }
+      );
+    }
+  }
+
+  // Set up max duration timeout
+  const maxDuration = options?.maxDuration ?? 0;
+  const timeoutId = maxDuration > 0
+    ? setTimeout(() => abortController.abort(new Error("Session timeout")), maxDuration)
+    : undefined;
+
+  const session: ILLMSession = {
+    embed: (text, opts) => llm.embed(text, opts),
+    embedBatch: (texts) => llm.embedBatch(texts),
+    expandQuery: (query, opts) => llm.expandQuery(query, opts),
+    rerank: (query, docs, opts) => llm.rerank(query, docs, opts),
+    get isValid() { return !abortController.signal.aborted; },
+    get signal() { return abortController.signal; },
+  };
 
   try {
     return await fn(session);
   } finally {
-    session.release();
+    if (timeoutId) clearTimeout(timeoutId);
   }
 }
 
