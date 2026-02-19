@@ -14,6 +14,9 @@ Fork-specific code lives in **fork-only files** that upstream doesn't have. This
 | `src/llm-provider.ts` | Backend selection — reads config, injects via `setDefaultLlamaCpp()` |
 | `src/test-config.ts` | Test environment helpers (local vs remote LLM) |
 | `test/llm-remote.test.ts` | Fork-specific tests (pure functions + integration) |
+| `src/anki.ts` | AnkiConnect JSON-RPC client |
+| `src/anki-provider.ts` | Anki collection management, indexing, CLI handlers |
+| `test/anki-provider.test.ts` | Anki overlay tests |
 | `server/deploy.py` | Tailscale+systemd deployment for vLLM + embed/rerank |
 | `MERGE_UPSTREAM.md` | This file |
 
@@ -21,7 +24,7 @@ Fork-specific code lives in **fork-only files** that upstream doesn't have. This
 
 | File | Changes |
 |------|---------|
-| `src/qmd.ts` | 1 import, 3 parseArgs options, 1 `initLLMProvider()` call |
+| `src/qmd.ts` | 2 imports, 7 parseArgs options, `initLLMProvider()` call, Anki command routing + hooks |
 | `.gitignore` | 1 line: `!MERGE_UPSTREAM.md` |
 
 ## Prerequisites
@@ -65,9 +68,11 @@ If there are conflicts, they should only be in `qmd.ts` (the one file we modify)
 
 The only likely conflict is in `src/qmd.ts`. Look for our fork additions:
 
-1. **Import** (after `from "./llm.js"` import): `import { initLLMProvider } from "./llm-provider.js";`
-2. **parseArgs options** (in `parseCLI()`): `remote`, `local`, `remote-url` options
-3. **Init call** (after `setConfigIndexName`): `initLLMProvider({ ... })`
+1. **LLM import** (after `from "./llm.js"`): `import { initLLMProvider } from "./llm-provider.js";`
+2. **Anki import** (after LLM import): `import { isAnkiCollection, ... } from "./anki-provider.js";`
+3. **parseArgs options** (in `parseCLI()`): `remote`, `local`, `remote-url`, `anki`, `deck`, `note-type`, `tag`
+4. **Init call** (after `setConfigIndexName`): `initLLMProvider({ ... })`
+5. **Anki hooks**: `case "anki"` routing, `--anki` in collection add, Anki branch in `updateCollections()`, Anki display in `collectionList()`
 
 Keep both upstream's changes and our additions.
 
@@ -119,5 +124,6 @@ If upstream modifies `llm.ts` types that `llm-remote.ts` imports (e.g., `LLM`, `
 | Remote LLM provider (`llm-remote.ts`) | Local-only LlamaCpp |
 | Provider selection (`llm-provider.ts`) | Single LlamaCpp singleton |
 | Server deployment (`server/deploy.py`) | No server infrastructure |
+| Anki collection support (`anki.ts`, `anki-provider.ts`) | No Anki integration |
 | Test config (`test-config.ts`) | CI-skip via `process.env.CI` |
-| Minimal `qmd.ts` modification (--remote/--local flags) | No remote flags |
+| Minimal `qmd.ts` modification (LLM + Anki hooks) | No remote/Anki flags |
