@@ -71,6 +71,7 @@ import {
   getDefaultDbPath,
 } from "./store.js";
 import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "./llm.js";
+import { initLLMProvider } from "./llm-provider.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -2267,6 +2268,10 @@ function parseCLI() {
       http: { type: "boolean" },
       daemon: { type: "boolean" },
       port: { type: "string" },
+      // Remote LLM options (fork-only)
+      remote: { type: "boolean" },
+      local: { type: "boolean" },
+      "remote-url": { type: "string" },
     },
     allowPositionals: true,
     strict: false, // Allow unknown options to pass through
@@ -2278,6 +2283,14 @@ function parseCLI() {
     setIndexName(indexName);
     setConfigIndexName(indexName);
   }
+
+  // Initialize LLM provider (remote or local) — fork-only
+  initLLMProvider({
+    forceLocal: !!values.local,
+    forceRemote: !!values.remote,
+    remoteUrl: values["remote-url"] as string | undefined,
+    indexName: indexName || "index",
+  });
 
   // Determine output format
   let format: OutputFormat = "cli";
