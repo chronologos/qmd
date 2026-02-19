@@ -327,8 +327,7 @@ describe("lex query syntax", () => {
   // Note: These test via CLI behavior since buildFTS5Query is not exported
 
   describe("validateSemanticQuery", () => {
-    // Import the validation function
-    const { validateSemanticQuery } = require("../src/store.js");
+    const { validateSemanticQuery } = await import("../src/store.js");
 
     test("accepts plain natural language", () => {
       expect(validateSemanticQuery("how does error handling work")).toBeNull();
