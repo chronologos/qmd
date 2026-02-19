@@ -493,7 +493,9 @@ async function updateCollections(): Promise<void> {
       console.log(`${c.cyan}[${i + 1}/${collections.length}]${c.reset} ${c.bold}${col.name}${c.reset} ${c.dim}(source: anki)${c.reset}`);
       const ankiConfig = getAnkiCollectionConfig(col.name);
       if (ankiConfig) {
-        const result = await indexAnkiCollection(db, col.name, ankiConfig, (msg) => {
+        // Re-acquire db handle — indexFiles() closes it after each collection
+        const ankiDb = getDb();
+        const result = await indexAnkiCollection(ankiDb, col.name, ankiConfig, (msg) => {
           process.stderr.write(`\r  ${msg}        `);
         });
         process.stderr.write("\r" + " ".repeat(60) + "\r");
