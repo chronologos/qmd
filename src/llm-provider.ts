@@ -15,7 +15,7 @@
  *   api_key: "${QMD_REMOTE_API_KEY}"  # optional, supports env var expansion
  *   models:
  *     embed: Qwen/Qwen3-Embedding-4B
- *     generate: Qwen/Qwen3-8B
+ *     generate: Qwen/Qwen3-4B
  *     rerank: Qwen/Qwen3-Reranker-4B
  * ```
  */

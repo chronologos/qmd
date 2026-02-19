@@ -14,7 +14,7 @@ Usage:
     sudo python3 deploy.py vllm --status
     sudo python3 deploy.py vllm --logs
     sudo python3 deploy.py vllm --restart
-    sudo python3 deploy.py vllm --model "Qwen/Qwen3-8B"
+    sudo python3 deploy.py vllm --model "Qwen/Qwen3-4B"
 
     sudo python3 deploy.py embed --status
     sudo python3 deploy.py embed --logs
@@ -53,7 +53,7 @@ EMBED_PORT = 8001
 VLLM_CONTAINER_NAME = "qmd-vllm"
 VLLM_IMAGE = "nvcr.io/nvidia/vllm:25.12.post1-py3"
 VLLM_PORT = 8000
-VLLM_DEFAULT_MODEL = "Qwen/Qwen3-8B"
+VLLM_DEFAULT_MODEL = "Qwen/Qwen3-4B"
 VLLM_GPU_MEMORY_UTILIZATION = 0.3  # Leave room for embed/rerank on same GPU
 
 

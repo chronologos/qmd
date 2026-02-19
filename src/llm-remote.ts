@@ -148,6 +148,20 @@ function backoff(attempt: number): Promise<void> {
 // Query Expansion Helpers
 // =============================================================================
 
+const EXPAND_SYSTEM_PROMPT = `Expand search queries into multiple search formulations. Output ONLY lines in this exact format:
+lex: keyword terms here
+vec: semantic phrase here
+hyde: hypothetical answer passage here
+
+Example for "benefits of meditation":
+lex: meditation benefits health
+vec: positive effects of regular meditation practice
+hyde: Meditation has been shown to reduce stress and anxiety levels while improving focus and emotional regulation
+lex: mindfulness stress reduction
+vec: how meditation improves mental and physical wellbeing
+
+Output 4-8 lines. No other text, no explanations.`;
+
 /**
  * Parse raw text output into Queryable objects.
  *
@@ -390,20 +404,40 @@ export class RemoteLLM implements LLM {
     options: { context?: string; includeLexical?: boolean } = {}
   ): Promise<Queryable[]> {
     const includeLexical = options.includeLexical ?? true;
+    const model = this.config.models?.generate || "default";
 
     try {
-      const prompt = `/no_think Expand this search query: ${query}`;
-      const result = await this.generate(prompt, {
-        maxTokens: 600,
-        temperature: 0.7,
-      });
+      const response = await fetchWithRetry(
+        `${this.config.generationUrl}/v1/chat/completions`,
+        {
+          model,
+          messages: [
+            { role: "system", content: EXPAND_SYSTEM_PROMPT },
+            { role: "user", content: `/no_think ${query}` },
+          ],
+          max_tokens: 400,
+          temperature: 0.7,
+          top_p: 0.8,
+          top_k: 20,
+        },
+        this.retryOpts
+      );
 
-      if (!result?.text) {
+      const data = (await response.json()) as {
+        choices: { message: { content: string }; finish_reason: string }[];
+        model: string;
+      };
+
+      const text = data.choices?.[0]?.message?.content;
+      if (!text) {
         return createFallbackQueryables(query, includeLexical);
       }
 
+      // Strip <think>...</think> wrapper if present
+      const cleaned = text.replace(/<think>[\s\S]*?<\/think>\s*/g, "").trim();
+
       // Parse the structured output
-      const queryables = parseQueryables(result.text, includeLexical);
+      const queryables = parseQueryables(cleaned, includeLexical);
 
       // Filter to retain only expansions that share terms with the original query
       const filtered = filterByQueryTerms(queryables, query);

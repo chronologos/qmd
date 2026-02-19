@@ -83,13 +83,13 @@ sudo python3 deploy.py --stop     # Stop service
 # Pull the NVIDIA vLLM container (DGX Spark optimized)
 docker pull nvcr.io/nvidia/vllm:25.12.post1-py3
 
-# Start vLLM serving Qwen3-8B for query expansion
+# Start vLLM serving Qwen3-4B for query expansion
 docker run -d --gpus all \
   -p 127.0.0.1:8000:8000 \
   --restart unless-stopped \
   --name qmd-vllm \
   nvcr.io/nvidia/vllm:25.12.post1-py3 \
-  vllm serve "Qwen/Qwen3-8B"
+  vllm serve "Qwen/Qwen3-4B"
 
 # Set up Tailscale Serve for vLLM
 sudo tailscale serve --service svc:qmd-vllm --bg --https=443 127.0.0.1:8000
@@ -113,7 +113,7 @@ remote:
   embed_url: "https://qmd-embed.<tailnet>.ts.net"
   models:
     embed: "Qwen/Qwen3-Embedding-4B"
-    generate: "Qwen/Qwen3-8B"
+    generate: "Qwen/Qwen3-4B"
     rerank: "Qwen/Qwen3-Reranker-4B"
 ```
 
@@ -220,8 +220,8 @@ Response:
 | Embedding | `Qwen/Qwen3-Embedding-0.6B` | 0.6B | Faster alternative, still excellent |
 | Reranking | `Qwen/Qwen3-Reranker-4B` | 4B | +13% vs bge-reranker, excellent code retrieval |
 | Reranking | `Qwen/Qwen3-Reranker-0.6B` | 0.6B | Drop-in speed, +6% quality |
-| Generation | `Qwen/Qwen3-8B` | 8B | +20% quality over Qwen2.5-3B, 128K context |
-| Generation | `Qwen/Qwen3-4B` | 4B | Faster, still better than Qwen2.5-3B |
+| Generation | `Qwen/Qwen3-4B` | 4B | Default, good quality for query expansion, 128K context |
+| Generation | `Qwen/Qwen3-8B` | 8B | Higher quality, use if VRAM allows |
 
 **Legacy models** (for backward compatibility):
 
@@ -273,5 +273,5 @@ docker rm -f qmd-vllm
 docker run -d --gpus all -p 127.0.0.1:8000:8000 \
   --restart unless-stopped --name qmd-vllm \
   nvcr.io/nvidia/vllm:25.12.post1-py3 \
-  vllm serve "Qwen/Qwen3-8B"
+  vllm serve "Qwen/Qwen3-4B"
 ```
