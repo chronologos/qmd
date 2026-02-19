@@ -6,14 +6,17 @@
  * Environment variables:
  *   QMD_TEST_REMOTE=1            — Use remote LLM backend
  *   QMD_TEST_LOCAL=1             — Use local LLM backend (downloads models)
- *   QMD_TEST_REMOTE_URL=<url>    — Remote URL (default: http://localhost:8000)
- *   QMD_TEST_EMBED_URL=<url>     — Embed service URL
- *   QMD_TEST_GENERATION_URL=<url> — Generation service URL
+ *   QMD_TEST_GENERATION_URL=<url> — Override generation service URL
+ *   QMD_TEST_EMBED_URL=<url>     — Override embed service URL
  *   Neither set                  — Skip LLM tests
+ *
+ * When QMD_TEST_REMOTE=1 without explicit URLs, reads ~/.config/qmd/index.yml
+ * (same config file used by the CLI).
  */
 
 import { getDefaultLlamaCpp, setDefaultLlamaCpp, disposeDefaultLlamaCpp } from "./llm.js";
 import { RemoteLLM } from "./llm-remote.js";
+import { initLLMProvider, resetLLMProvider } from "./llm-provider.js";
 
 export function shouldUseRemoteLLM(): boolean {
   return process.env.QMD_TEST_REMOTE === "1";
@@ -38,11 +41,20 @@ export async function setupTestLLM(): Promise<ReturnType<typeof getDefaultLlamaC
   if (shouldSkipLLMTests()) return null;
 
   if (shouldUseRemoteLLM()) {
-    const remoteLLM = new RemoteLLM({
-      generationUrl: process.env.QMD_TEST_GENERATION_URL || process.env.QMD_TEST_REMOTE_URL || "http://localhost:8000",
-      embedUrl: process.env.QMD_TEST_EMBED_URL || process.env.QMD_TEST_REMOTE_URL || "http://localhost:8001",
-    });
-    setDefaultLlamaCpp(remoteLLM as any);
+    const hasExplicitUrls = process.env.QMD_TEST_GENERATION_URL || process.env.QMD_TEST_EMBED_URL;
+
+    if (hasExplicitUrls) {
+      // Explicit URLs override everything
+      const remoteLLM = new RemoteLLM({
+        generationUrl: process.env.QMD_TEST_GENERATION_URL || "http://localhost:8000",
+        embedUrl: process.env.QMD_TEST_EMBED_URL || "http://localhost:8001",
+      });
+      setDefaultLlamaCpp(remoteLLM as any);
+    } else {
+      // Use config file (same as CLI: ~/.config/qmd/index.yml)
+      resetLLMProvider();
+      initLLMProvider({ forceRemote: true });
+    }
   }
 
   return getDefaultLlamaCpp();

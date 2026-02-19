@@ -274,7 +274,7 @@ export class RemoteLLM implements LLM {
       };
 
       if (!data.data?.[0]?.embedding) {
-        console.error("Remote embed: unexpected response shape");
+        console.error(`Remote embed: unexpected response shape from ${this.config.embedUrl}/v1/embeddings:`, JSON.stringify(data).slice(0, 500));
         return null;
       }
 
@@ -282,8 +282,8 @@ export class RemoteLLM implements LLM {
         embedding: data.data[0].embedding,
         model: data.model || model,
       };
-    } catch (error) {
-      console.error("Remote embed error:", error);
+    } catch (error: any) {
+      console.error(`Remote embed error (${this.config.embedUrl}/v1/embeddings):`, error?.message || error);
       return null;
     }
   }
@@ -313,7 +313,7 @@ export class RemoteLLM implements LLM {
       };
 
       if (!data.data || !Array.isArray(data.data)) {
-        console.error("Remote embedBatch: unexpected response shape");
+        console.error(`Remote embedBatch: unexpected response shape from ${this.config.embedUrl}/v1/embeddings:`, JSON.stringify(data).slice(0, 500));
         return texts.map(() => null);
       }
 
@@ -331,8 +331,8 @@ export class RemoteLLM implements LLM {
       }
 
       return results;
-    } catch (error) {
-      console.error("Remote embedBatch error:", error);
+    } catch (error: any) {
+      console.error(`Remote embedBatch error (${this.config.embedUrl}/v1/embeddings):`, error?.message || error);
       return texts.map(() => null);
     }
   }

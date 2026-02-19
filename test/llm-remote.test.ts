@@ -205,6 +205,7 @@ describe("RemoteLLM integration", () => {
 
     expect(result.results).toHaveLength(3);
     expect(result.results[0]!.file).toBe("france.txt");
+    expect(result.results[0]!.score).toBeGreaterThan(0); // Catches silent error fallback
   });
 
   test("can exclude lexical queries from expandQuery", async () => {
