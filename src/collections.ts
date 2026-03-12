@@ -26,6 +26,7 @@ export type ContextMap = Record<string, string>;
  */
 export interface Collection {
   path: string;              // Absolute path to index
+  source?: string;           // Collection source type (e.g., "anki") — fork-only
   pattern: string;           // Glob pattern (e.g., "**/*.md")
   ignore?: string[];         // Glob patterns to exclude (e.g., ["Sessions/**"])
   context?: ContextMap;      // Optional context definitions
@@ -154,6 +155,19 @@ export function loadConfig(): CollectionConfig {
     // Ensure collections object exists
     if (!config.collections) {
       config.collections = {};
+    }
+
+    // Normalize non-filesystem collections (fork-only):
+    // Anki collections have `source: anki` but no path/pattern in YAML.
+    // Synthesize placeholder values so they satisfy the Collection interface
+    // while preserving the source marker for anki-provider to detect.
+    for (const [name, coll] of Object.entries(config.collections)) {
+      const raw = coll as unknown as Record<string, unknown>;
+      if (raw.source === 'anki') {
+        coll.source = 'anki';
+        if (!coll.path) coll.path = `anki://${name}`;
+        if (!coll.pattern) coll.pattern = '**/*';
+      }
     }
 
     return config;

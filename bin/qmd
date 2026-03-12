@@ -20,8 +20,9 @@ DIR="$(cd -P "$(dirname "$SOURCE")/.." && pwd)"
 # exists on the system, not that it was used to install this package.  When QMD
 # is installed via npm, native modules are compiled for Node and running them
 # under bun causes ABI mismatches (e.g. sqlite-vec "no such module: vec0").
-if [ -f "$DIR/bun.lock" ] || [ -f "$DIR/bun.lockb" ]; then
-  exec bun "$DIR/dist/cli/qmd.js" "$@"
-else
-  exec node "$DIR/dist/cli/qmd.js" "$@"
-fi
+#
+# Fork-only: always use node for compiled dist.  Bun ≤1.3's bun:sqlite does
+# not support loadExtension(), which sqlite-vec requires.  better-sqlite3
+# (the Node path in db.ts) works fine.  Since `bun install` compiles native
+# addons with the same toolchain node uses, the binaries are compatible.
+exec node "$DIR/dist/cli/qmd.js" "$@"
