@@ -184,6 +184,7 @@ const c = {
   green: useColor ? "\x1b[32m" : "",
   magenta: useColor ? "\x1b[35m" : "",
   blue: useColor ? "\x1b[34m" : "",
+  red: useColor ? "\x1b[31m" : "",
 };
 
 // Terminal cursor control
