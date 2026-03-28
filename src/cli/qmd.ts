@@ -25,7 +25,6 @@ import {
   isDocid,
   matchFilesByGlob,
   getHashesNeedingEmbedding,
-  getHashesForEmbedding,
   clearAllEmbeddings,
   insertEmbedding,
   getStatus,
@@ -65,6 +64,8 @@ import {
   type ExpandedQuery,
   type HybridQueryExplain,
   DEFAULT_EMBED_MODEL,
+  DEFAULT_EMBED_MAX_BATCH_BYTES,
+  DEFAULT_EMBED_MAX_DOCS_PER_BATCH,
   DEFAULT_RERANK_MODEL,
   DEFAULT_GLOB,
   DEFAULT_MULTI_GET_MAX_BYTES,
@@ -1638,7 +1639,20 @@ function renderProgressBar(percent: number, width: number = 30): string {
   return bar;
 }
 
-async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean = false): Promise<void> {
+function parseEmbedBatchOption(name: string, value: unknown): number | undefined {
+  if (value === undefined) return undefined;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    throw new Error(`${name} must be a positive integer`);
+  }
+  return parsed;
+}
+
+async function vectorIndex(
+  model: string = DEFAULT_EMBED_MODEL,
+  force: boolean = false,
+  batchOptions?: { maxDocsPerBatch?: number; maxBatchBytes?: number },
+): Promise<void> {
   const storeInstance = getStore();
   const db = storeInstance.db;
 
@@ -1647,14 +1661,19 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
   }
 
   // Check if there's work to do before starting
-  const hashesToEmbed = getHashesForEmbedding(db);
-  if (hashesToEmbed.length === 0 && !force) {
+  const hashesToEmbed = getHashesNeedingEmbedding(db);
+  if (hashesToEmbed === 0 && !force) {
     console.log(`${c.green}✓ All content hashes already have embeddings.${c.reset}`);
     closeDb();
     return;
   }
 
   console.log(`${c.dim}Model: ${model}${c.reset}\n`);
+  if (batchOptions?.maxDocsPerBatch !== undefined || batchOptions?.maxBatchBytes !== undefined) {
+    const maxDocsPerBatch = batchOptions.maxDocsPerBatch ?? DEFAULT_EMBED_MAX_DOCS_PER_BATCH;
+    const maxBatchBytes = batchOptions.maxBatchBytes ?? DEFAULT_EMBED_MAX_BATCH_BYTES;
+    console.log(`${c.dim}Batch: ${maxDocsPerBatch} docs / ${formatBytes(maxBatchBytes)}${c.reset}\n`);
+  }
   cursor.hide();
   progress.indeterminate();
 
@@ -1663,6 +1682,8 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
   const result = await generateEmbeddings(storeInstance, {
     force,
     model,
+    maxDocsPerBatch: batchOptions?.maxDocsPerBatch,
+    maxBatchBytes: batchOptions?.maxBatchBytes,
     onProgress: (info) => {
       if (info.totalBytes === 0) return;
       const percent = (info.bytesProcessed / info.totalBytes) * 100;
@@ -1755,6 +1776,7 @@ type OutputOptions = {
   context?: string;      // Optional context for query expansion
   candidateLimit?: number;  // Max candidates to rerank (default: 40)
   intent?: string;       // Domain intent for disambiguation
+  skipRerank?: boolean;  // Skip LLM reranking, use RRF scores only
 };
 
 // Highlight query terms in text (skip short words < 3 chars)
@@ -2237,6 +2259,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
         limit: opts.all ? 500 : (opts.limit || 10),
         minScore: opts.minScore || 0,
         candidateLimit: opts.candidateLimit,
+        skipRerank: opts.skipRerank,
         explain: !!opts.explain,
         intent,
         hooks: {
@@ -2263,6 +2286,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
         limit: opts.all ? 500 : (opts.limit || 10),
         minScore: opts.minScore || 0,
         candidateLimit: opts.candidateLimit,
+        skipRerank: opts.skipRerank,
         explain: !!opts.explain,
         intent,
         hooks: {
@@ -2365,6 +2389,8 @@ function parseCLI() {
       mask: { type: "string" },  // glob pattern
       // Embed options
       force: { type: "boolean", short: "f" },
+      "max-docs-per-batch": { type: "string" },
+      "max-batch-mb": { type: "string" },
       // Update options
       pull: { type: "boolean" },  // git pull before update
       refresh: { type: "boolean" },
@@ -2375,6 +2401,7 @@ function parseCLI() {
       "line-numbers": { type: "boolean" },  // add line numbers to output
       // Query options
       "candidate-limit": { type: "string", short: "C" },
+      "no-rerank": { type: "boolean", default: false },
       intent: { type: "string" },
       // MCP HTTP transport options
       http: { type: "boolean" },
@@ -2431,6 +2458,7 @@ function parseCLI() {
     collection: values.collection as string[] | undefined,
     lineNumbers: !!values["line-numbers"],
     candidateLimit: values["candidate-limit"] ? parseInt(String(values["candidate-limit"]), 10) : undefined,
+    skipRerank: !!values["no-rerank"],
     explain: !!values.explain,
     intent: values.intent as string | undefined,
   };
@@ -2600,6 +2628,8 @@ function showHelp(): void {
   console.log("  qmd status                    - View index + collection health");
   console.log("  qmd update [--pull]           - Re-index collections (optionally git pull first)");
   console.log("  qmd embed [-f]                - Generate/refresh vector embeddings");
+  console.log("    --max-docs-per-batch <n>    - Cap docs loaded into memory per embedding batch");
+  console.log("    --max-batch-mb <n>          - Cap UTF-8 MB loaded into memory per embedding batch");
   console.log("  qmd cleanup                   - Clear caches, vacuum DB");
   console.log("");
   console.log("Query syntax (qmd query):");
@@ -2652,6 +2682,7 @@ function showHelp(): void {
   console.log("  --min-score <num>          - Minimum similarity score");
   console.log("  --full                     - Output full document instead of snippet");
   console.log("  -C, --candidate-limit <n>  - Max candidates to rerank (default 40, lower = faster)");
+  console.log("  --no-rerank                - Skip LLM reranking (use RRF scores only, much faster on CPU)");
   console.log("  --line-numbers             - Include line numbers in output");
   console.log("  --explain                  - Include retrieval score traces (query --json/CLI)");
   console.log("  --files | --json | --csv | --md | --xml  - Output format");
@@ -2997,7 +3028,17 @@ if (isMain) {
       break;
 
     case "embed":
-      await vectorIndex(DEFAULT_EMBED_MODEL, !!cli.values.force);
+      try {
+        const maxDocsPerBatch = parseEmbedBatchOption("maxDocsPerBatch", cli.values["max-docs-per-batch"]);
+        const maxBatchMb = parseEmbedBatchOption("maxBatchBytes", cli.values["max-batch-mb"]);
+        await vectorIndex(DEFAULT_EMBED_MODEL, !!cli.values.force, {
+          maxDocsPerBatch,
+          maxBatchBytes: maxBatchMb === undefined ? undefined : maxBatchMb * 1024 * 1024,
+        });
+      } catch (error) {
+        console.error(error instanceof Error ? error.message : String(error));
+        process.exit(1);
+      }
       break;
 
     case "pull": {
