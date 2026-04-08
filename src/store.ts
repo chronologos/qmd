@@ -1693,11 +1693,11 @@ export function getDocid(hash: string): string {
 /**
  * Handelize a filename to be more token-friendly.
  * - Convert triple underscore `___` to `/` (folder separator)
- * - Convert to lowercase
  * - Replace sequences of non-word chars (except /) with single dash
  * - Remove leading/trailing dashes from path segments
  * - Preserve folder structure (a/b/c/d.md stays structured)
  * - Preserve file extension
+ * - Preserve original case (important for case-sensitive filesystems)
  */
 /** Replace emoji/symbol codepoints with their hex representation (e.g. 🐘 → 1f418) */
 function emojiToHex(str: string): string {
@@ -1725,7 +1725,6 @@ export function handelize(path: string): string {
 
   const result = path
     .replace(/___/g, '/')       // Triple underscore becomes folder separator
-    .toLowerCase()
     .split('/')
     .map((segment, idx, arr) => {
       const isLastSegment = idx === arr.length - 1;
