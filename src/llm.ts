@@ -16,7 +16,7 @@ import {
 } from "node-llama-cpp";
 import { homedir } from "os";
 import { join } from "path";
-import { existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync, writeFileSync, openSync, readSync, closeSync } from "fs";
 
 // =============================================================================
 // Embedding Formatting Functions
@@ -155,7 +155,7 @@ export type LLMSessionOptions = {
  */
 export interface ILLMSession {
   embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null>;
-  embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]>;
+  embedBatch(texts: string[], options?: EmbedOptions): Promise<(EmbeddingResult | null)[]>;
   expandQuery(query: string, options?: { context?: string; includeLexical?: boolean }): Promise<Queryable[]>;
   rerank(query: string, documents: RerankDocument[], options?: RerankOptions): Promise<RerankResult>;
   /** Whether this session is still valid (not released or aborted) */
@@ -193,7 +193,7 @@ export type RerankDocument = {
 // HuggingFace model URIs for node-llama-cpp
 // Format: hf:<user>/<repo>/<file>
 // Override via QMD_EMBED_MODEL env var (e.g. hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf)
-const DEFAULT_EMBED_MODEL = process.env.QMD_EMBED_MODEL ?? "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
+const DEFAULT_EMBED_MODEL = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
 const DEFAULT_RERANK_MODEL = "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf";
 // const DEFAULT_GENERATE_MODEL = "hf:ggml-org/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf";
 const DEFAULT_GENERATE_MODEL = "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf";
@@ -209,7 +209,9 @@ export const DEFAULT_RERANK_MODEL_URI = DEFAULT_RERANK_MODEL;
 export const DEFAULT_GENERATE_MODEL_URI = DEFAULT_GENERATE_MODEL;
 
 // Local model cache directory
-const MODEL_CACHE_DIR = join(homedir(), ".cache", "qmd", "models");
+const MODEL_CACHE_DIR = process.env.XDG_CACHE_HOME
+  ? join(process.env.XDG_CACHE_HOME, "qmd", "models")
+  : join(homedir(), ".cache", "qmd", "models");
 export const DEFAULT_MODEL_CACHE_DIR = MODEL_CACHE_DIR;
 
 export type PullResult = {
@@ -244,6 +246,58 @@ async function getRemoteEtag(ref: HfRef): Promise<string | null> {
   } catch {
     return null;
   }
+}
+
+const GGUF_MAGIC = Buffer.from("GGUF");
+
+/**
+ * Validate that a file is actually a GGUF model, not an HTML error page
+ * from a proxy, firewall, or failed download.
+ * Throws a descriptive error if the file is not valid GGUF.
+ */
+function validateGgufFile(filePath: string, modelUri: string): void {
+  if (!existsSync(filePath)) return; // let downstream handle missing files
+
+  // Read header + sniff bytes in one go, then close immediately
+  const fd = openSync(filePath, "r");
+  const sniff = Buffer.alloc(512);
+  try {
+    readSync(fd, sniff, 0, 512, 0);
+  } finally {
+    closeSync(fd);
+  }
+
+  const header = sniff.subarray(0, 4);
+  if (header.equals(GGUF_MAGIC)) return; // valid GGUF
+
+  const text = sniff.toString("utf-8").toLowerCase();
+  const isHtml = text.includes("<!doctype") || text.includes("<html");
+  const got = header.toString("utf-8");
+  const sizeKB = (statSync(filePath).size / 1024).toFixed(0);
+
+  // Remove the bad file so the next attempt re-downloads
+  unlinkSync(filePath);
+
+  if (isHtml) {
+    throw new Error(
+      `Downloaded model file is an HTML page, not a GGUF model (${sizeKB} KB).\n` +
+      `Something is intercepting the download from huggingface.co (a proxy, firewall, or captive portal).\n\n` +
+      `Model: ${modelUri}\n` +
+      `Path:  ${filePath}\n\n` +
+      `To fix this, either:\n` +
+      `  1. Try a HuggingFace mirror:  HF_ENDPOINT=https://hf-mirror.com qmd embed\n` +
+      `  2. Download the model manually and set the env var, e.g.:\n` +
+      `       QMD_EMBED_MODEL=/path/to/model.gguf qmd embed\n\n` +
+      `Note: 'qmd search' works without any model downloads.`
+    );
+  }
+
+  throw new Error(
+    `Model file is not valid GGUF (expected magic "GGUF", got "${got}", file is ${sizeKB} KB).\n` +
+    `Model: ${modelUri}\n` +
+    `Path:  ${filePath}\n\n` +
+    `The file has been removed. Run the command again to re-download.`
+  );
 }
 
 export async function pullModels(
@@ -291,6 +345,7 @@ export async function pullModels(
     }
 
     const path = await resolveModelFile(model, cacheDir);
+    validateGgufFile(path, model);
     const sizeBytes = existsSync(path) ? statSync(path).size : 0;
     if (hfRef && filename) {
       const remoteEtag = await getRemoteEtag(hfRef);
@@ -383,6 +438,18 @@ export type LlamaCppConfig = {
 const DEFAULT_INACTIVITY_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_EXPAND_CONTEXT_SIZE = 2048;
 
+type LlamaGpuMode = "auto" | "metal" | "vulkan" | "cuda" | false;
+
+export function resolveLlamaGpuMode(envValue = process.env.QMD_LLAMA_GPU): LlamaGpuMode {
+  const normalized = envValue?.trim().toLowerCase() ?? "";
+  if (!normalized) return "auto";
+  if (["false", "off", "none", "disable", "disabled", "0"].includes(normalized)) return false;
+  if (normalized === "metal" || normalized === "vulkan" || normalized === "cuda") return normalized;
+
+  process.stderr.write(`QMD Warning: invalid QMD_LLAMA_GPU="${envValue}", using auto GPU selection.\n`);
+  return "auto";
+}
+
 function resolveExpandContextSize(configValue?: number): number {
   if (configValue !== undefined) {
     if (!Number.isInteger(configValue) || configValue <= 0) {
@@ -434,13 +501,17 @@ export class LlamaCpp implements LLM {
 
 
   constructor(config: LlamaCppConfig = {}) {
-    this.embedModelUri = config.embedModel || DEFAULT_EMBED_MODEL;
-    this.generateModelUri = config.generateModel || DEFAULT_GENERATE_MODEL;
-    this.rerankModelUri = config.rerankModel || DEFAULT_RERANK_MODEL;
+    this.embedModelUri = config.embedModel || process.env.QMD_EMBED_MODEL || DEFAULT_EMBED_MODEL;
+    this.generateModelUri = config.generateModel || process.env.QMD_GENERATE_MODEL || DEFAULT_GENERATE_MODEL;
+    this.rerankModelUri = config.rerankModel || process.env.QMD_RERANK_MODEL || DEFAULT_RERANK_MODEL;
     this.modelCacheDir = config.modelCacheDir || MODEL_CACHE_DIR;
     this.expandContextSize = resolveExpandContextSize(config.expandContextSize);
     this.inactivityTimeoutMs = config.inactivityTimeoutMs ?? DEFAULT_INACTIVITY_TIMEOUT_MS;
     this.disposeModelsOnInactivity = config.disposeModelsOnInactivity ?? false;
+  }
+
+  get embedModelName(): string {
+    return this.embedModelUri;
   }
 
   /**
@@ -544,13 +615,33 @@ export class LlamaCpp implements LLM {
   /**
    * Initialize the llama instance (lazy)
    */
-  private async ensureLlama(): Promise<Llama> {
+  private async ensureLlama(allowBuild = true): Promise<Llama> {
     if (!this.llama) {
-      const llama = await getLlama({
-        // attempt to build
-        build: "autoAttempt",
-        logLevel: LlamaLogLevel.error
-      });
+      const gpuMode = resolveLlamaGpuMode();
+
+      const loadLlama = async (gpu: LlamaGpuMode) =>
+        await getLlama({
+          build: allowBuild ? "autoAttempt" : "never",
+          logLevel: LlamaLogLevel.error,
+          gpu,
+          skipDownload: !allowBuild,
+        });
+
+      let llama: Llama;
+      if (gpuMode === false) {
+        llama = await loadLlama(false);
+      } else {
+        try {
+          llama = await loadLlama(gpuMode);
+        } catch (err) {
+          // GPU backend (e.g. Vulkan on headless/driverless machines) can throw at init.
+          // Fall back to CPU so qmd still works.
+          process.stderr.write(
+            `QMD Warning: GPU init failed${gpuMode === "auto" ? "" : ` for QMD_LLAMA_GPU=${gpuMode}`} (${err instanceof Error ? err.message : String(err)}), falling back to CPU.\n`
+          );
+          llama = await loadLlama(false);
+        }
+      }
 
       if (llama.gpu === false) {
         process.stderr.write(
@@ -563,12 +654,16 @@ export class LlamaCpp implements LLM {
   }
 
   /**
-   * Resolve a model URI to a local path, downloading if needed
+   * Resolve a model URI to a local path, downloading if needed.
+   * Validates the downloaded file is actually a GGUF model (not an HTML error page
+   * from a proxy or firewall).
    */
   private async resolveModel(modelUri: string): Promise<string> {
     this.ensureModelCacheDir();
     // resolveModelFile handles HF URIs and downloads to the cache dir
-    return await resolveModelFile(modelUri, this.modelCacheDir);
+    const modelPath = await resolveModelFile(modelUri, this.modelCacheDir);
+    validateGgufFile(modelPath, modelUri);
+    return modelPath;
   }
 
   /**
@@ -663,6 +758,7 @@ export class LlamaCpp implements LLM {
       for (let i = 0; i < n; i++) {
         try {
           this.embedContexts.push(await model.createEmbeddingContext({
+            contextSize: LlamaCpp.EMBED_CONTEXT_SIZE,
             ...(threads > 0 ? { threads } : {}),
           }));
         } catch {
@@ -757,9 +853,21 @@ export class LlamaCpp implements LLM {
    * - Combined: drops from 11.6 GB (auto, no flash) to 568 MB per context (20×)
    */
   // Qwen3 reranker template adds ~200 tokens overhead (system prompt, tags, etc.)
-  // Chunks are max 800 tokens, so 800 + 200 + query ≈ 1100 tokens typical.
-  // Use 2048 for safety margin. Still 17× less than auto (40960).
-  private static readonly RERANK_CONTEXT_SIZE = 2048;
+  // Default 2048 was too small for longer documents (e.g. session transcripts,
+  // CJK text, or large markdown files) — callers hit "input lengths exceed
+  // context size" errors even after truncation because the overhead estimate
+  // was insufficient.  4096 comfortably fits the largest real-world chunks
+  // while staying well below the 40 960-token auto size.
+  // Override with QMD_RERANK_CONTEXT_SIZE env var if you need more headroom.
+  private static readonly RERANK_CONTEXT_SIZE: number = (() => {
+    const v = parseInt(process.env.QMD_RERANK_CONTEXT_SIZE ?? "", 10);
+    return Number.isFinite(v) && v > 0 ? v : 4096;
+  })();
+
+  private static readonly EMBED_CONTEXT_SIZE: number = (() => {
+    const v = parseInt(process.env.QMD_EMBED_CONTEXT_SIZE ?? "", 10);
+    return Number.isFinite(v) && v > 0 ? v : 2048;
+  })();
   private async ensureRerankContexts(): Promise<Awaited<ReturnType<LlamaModel["createRankingContext"]>>[]> {
     if (this.rerankContexts.length === 0) {
       const model = await this.ensureRerankModel();
@@ -838,20 +946,30 @@ export class LlamaCpp implements LLM {
    * detokenizes back to text if truncation is needed.
    * Returns the (possibly truncated) text and whether truncation occurred.
    */
-  private async truncateToContextSize(text: string): Promise<{ text: string; truncated: boolean }> {
-    if (!this.embedModel) return { text, truncated: false };
+  private resolveEmbedTokenLimit(): number {
+    const trainedContextSize = this.embedModel?.trainContextSize;
+    if (typeof trainedContextSize === "number" && Number.isFinite(trainedContextSize) && trainedContextSize > 0) {
+      return Math.max(1, Math.min(LlamaCpp.EMBED_CONTEXT_SIZE, trainedContextSize));
+    }
+    return LlamaCpp.EMBED_CONTEXT_SIZE;
+  }
 
-    const maxTokens = this.embedModel.trainContextSize;
-    if (maxTokens <= 0) return { text, truncated: false };
+  private async truncateToContextSize(
+    text: string
+  ): Promise<{ text: string; truncated: boolean; limit: number }> {
+    if (!this.embedModel) return { text, truncated: false, limit: LlamaCpp.EMBED_CONTEXT_SIZE };
+
+    const maxTokens = this.resolveEmbedTokenLimit();
+    if (maxTokens <= 0) return { text, truncated: false, limit: maxTokens };
 
     const tokens = this.embedModel.tokenize(text);
-    if (tokens.length <= maxTokens) return { text, truncated: false };
+    if (tokens.length <= maxTokens) return { text, truncated: false, limit: maxTokens };
 
     // Leave a small margin (4 tokens) for BOS/EOS overhead
     const safeLimit = Math.max(1, maxTokens - 4);
     const truncatedTokens = tokens.slice(0, safeLimit);
     const truncatedText = this.embedModel.detokenize(truncatedTokens);
-    return { text: truncatedText, truncated: true };
+    return { text: truncatedText, truncated: true, limit: maxTokens };
   }
 
   async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
@@ -862,16 +980,16 @@ export class LlamaCpp implements LLM {
       const context = await this.ensureEmbedContext();
 
       // Guard: truncate text that exceeds model context window to prevent GGML crash
-      const { text: safeText, truncated } = await this.truncateToContextSize(text);
+      const { text: safeText, truncated, limit } = await this.truncateToContextSize(text);
       if (truncated) {
-        console.warn(`⚠ Text truncated to fit embedding context (${this.embedModel?.trainContextSize} tokens)`);
+        console.warn(`⚠ Text truncated to fit embedding context (${limit} tokens)`);
       }
 
       const embedding = await context.getEmbeddingFor(safeText);
 
       return {
         embedding: Array.from(embedding.vector),
-        model: this.embedModelUri,
+        model: options.model ?? this.embedModelUri,
       };
     } catch (error) {
       console.error("Embedding error:", error);
@@ -883,7 +1001,7 @@ export class LlamaCpp implements LLM {
    * Batch embed multiple texts efficiently
    * Uses Promise.all for parallel embedding - node-llama-cpp handles batching internally
    */
-  async embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]> {
+  async embedBatch(texts: string[], options: EmbedOptions = {}): Promise<(EmbeddingResult | null)[]> {
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
@@ -900,13 +1018,13 @@ export class LlamaCpp implements LLM {
         const embeddings: ({ embedding: number[]; model: string } | null)[] = [];
         for (const text of texts) {
           try {
-            const { text: safeText, truncated } = await this.truncateToContextSize(text);
+            const { text: safeText, truncated, limit } = await this.truncateToContextSize(text);
             if (truncated) {
-              console.warn(`⚠ Batch text truncated to fit embedding context (${this.embedModel?.trainContextSize} tokens)`);
+              console.warn(`⚠ Batch text truncated to fit embedding context (${limit} tokens)`);
             }
             const embedding = await context.getEmbeddingFor(safeText);
             this.touchActivity();
-            embeddings.push({ embedding: Array.from(embedding.vector), model: this.embedModelUri });
+            embeddings.push({ embedding: Array.from(embedding.vector), model: options.model ?? this.embedModelUri });
           } catch (err) {
             console.error("Embedding error for text:", err);
             embeddings.push(null);
@@ -927,13 +1045,13 @@ export class LlamaCpp implements LLM {
           const results: (EmbeddingResult | null)[] = [];
           for (const text of chunk) {
             try {
-              const { text: safeText, truncated } = await this.truncateToContextSize(text);
+              const { text: safeText, truncated, limit } = await this.truncateToContextSize(text);
               if (truncated) {
-                console.warn(`⚠ Batch text truncated to fit embedding context (${this.embedModel?.trainContextSize} tokens)`);
+                console.warn(`⚠ Batch text truncated to fit embedding context (${limit} tokens)`);
               }
               const embedding = await ctx.getEmbeddingFor(safeText);
               this.touchActivity();
-              results.push({ embedding: Array.from(embedding.vector), model: this.embedModelUri });
+              results.push({ embedding: Array.from(embedding.vector), model: options.model ?? this.embedModelUri });
             } catch (err) {
               console.error("Embedding error for text:", err);
               results.push(null);
@@ -1099,8 +1217,10 @@ export class LlamaCpp implements LLM {
     }
   }
 
-  // Qwen3 reranker chat template overhead (system prompt, tags, separators)
-  private static readonly RERANK_TEMPLATE_OVERHEAD = 200;
+  // Qwen3 reranker chat template overhead (system prompt, tags, separators).
+  // Measured at ~350 tokens on real queries; use 512 as a safe upper bound so
+  // the truncation budget never lets a document slip past the context limit.
+  private static readonly RERANK_TEMPLATE_OVERHEAD = 512;
   private static readonly RERANK_TARGET_DOCS_PER_CONTEXT = 10;
 
   async rerank(
@@ -1202,14 +1322,14 @@ export class LlamaCpp implements LLM {
    * Get device/GPU info for status display.
    * Initializes llama if not already done.
    */
-  async getDeviceInfo(): Promise<{
+  async getDeviceInfo(options: { allowBuild?: boolean } = {}): Promise<{
     gpu: string | false;
     gpuOffloading: boolean;
     gpuDevices: string[];
     vram?: { total: number; used: number; free: number };
     cpuCores: number;
   }> {
-    const llama = await this.ensureLlama();
+    const llama = await this.ensureLlama(options.allowBuild ?? true);
     const gpuDevices = await llama.getGpuDeviceNames();
     let vram: { total: number; used: number; free: number } | undefined;
     if (llama.gpu) {
@@ -1420,8 +1540,8 @@ class LLMSession implements ILLMSession {
     return this.withOperation(() => this.manager.getLlamaCpp().embed(text, options));
   }
 
-  async embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]> {
-    return this.withOperation(() => this.manager.getLlamaCpp().embedBatch(texts));
+  async embedBatch(texts: string[], options?: EmbedOptions): Promise<(EmbeddingResult | null)[]> {
+    return this.withOperation(() => this.manager.getLlamaCpp().embedBatch(texts, options));
   }
 
   async expandQuery(
@@ -1521,8 +1641,7 @@ let defaultLlamaCpp: LlamaCpp | null = null;
  */
 export function getDefaultLlamaCpp(): LlamaCpp {
   if (!defaultLlamaCpp) {
-    const embedModel = process.env.QMD_EMBED_MODEL;
-    defaultLlamaCpp = new LlamaCpp(embedModel ? { embedModel } : {});
+    defaultLlamaCpp = new LlamaCpp();
   }
   return defaultLlamaCpp;
 }

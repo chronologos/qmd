@@ -12,6 +12,7 @@ import {
   LlamaCpp,
   getDefaultLlamaCpp,
   disposeDefaultLlamaCpp,
+  resolveLlamaGpuMode,
   withLLMSession,
   canUnloadLLM,
   SessionReleasedError,
@@ -52,6 +53,38 @@ describe("LlamaCpp.modelExists", () => {
 
     expect(result.exists).toBe(false);
     expect(result.name).toBe("/nonexistent/path/model.gguf");
+  });
+});
+
+describe("QMD_LLAMA_GPU resolution", () => {
+  test("uses auto when unset or blank", () => {
+    expect(resolveLlamaGpuMode(undefined)).toBe("auto");
+    expect(resolveLlamaGpuMode("   ")).toBe("auto");
+  });
+
+  test("maps CPU disable values to false", () => {
+    expect(resolveLlamaGpuMode("false")).toBe(false);
+    expect(resolveLlamaGpuMode("OFF")).toBe(false);
+    expect(resolveLlamaGpuMode(" none ")).toBe(false);
+    expect(resolveLlamaGpuMode("disabled")).toBe(false);
+    expect(resolveLlamaGpuMode("0")).toBe(false);
+  });
+
+  test("passes through supported GPU backends", () => {
+    expect(resolveLlamaGpuMode("metal")).toBe("metal");
+    expect(resolveLlamaGpuMode("VULKAN")).toBe("vulkan");
+    expect(resolveLlamaGpuMode(" cuda ")).toBe("cuda");
+  });
+
+  test("warns and falls back to auto for unsupported values", () => {
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    try {
+      expect(resolveLlamaGpuMode("rocm")).toBe("auto");
+      expect(stderrSpy).toHaveBeenCalled();
+      expect(String(stderrSpy.mock.calls[0]?.[0] || "")).toContain("QMD_LLAMA_GPU");
+    } finally {
+      stderrSpy.mockRestore();
+    }
   });
 });
 
@@ -117,6 +150,76 @@ describe("LlamaCpp expand context size config", () => {
   });
 });
 
+describe("LlamaCpp model resolution (config > env > default)", () => {
+  const HARDCODED_EMBED = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
+  const HARDCODED_RERANK = "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf";
+  const HARDCODED_GENERATE = "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf";
+
+  test("uses hardcoded default when no config or env is set", () => {
+    const prev = process.env.QMD_EMBED_MODEL;
+    delete process.env.QMD_EMBED_MODEL;
+    try {
+      const llm = new LlamaCpp({}) as any;
+      expect(llm.embedModelUri).toBe(HARDCODED_EMBED);
+      expect(llm.rerankModelUri).toBe(HARDCODED_RERANK);
+      expect(llm.generateModelUri).toBe(HARDCODED_GENERATE);
+    } finally {
+      if (prev === undefined) delete process.env.QMD_EMBED_MODEL;
+      else process.env.QMD_EMBED_MODEL = prev;
+    }
+  });
+
+  test("env var overrides hardcoded default", () => {
+    const prev = process.env.QMD_EMBED_MODEL;
+    process.env.QMD_EMBED_MODEL = "hf:custom/embed-model.gguf";
+    try {
+      const llm = new LlamaCpp({}) as any;
+      expect(llm.embedModelUri).toBe("hf:custom/embed-model.gguf");
+    } finally {
+      if (prev === undefined) delete process.env.QMD_EMBED_MODEL;
+      else process.env.QMD_EMBED_MODEL = prev;
+    }
+  });
+
+  test("config overrides env var", () => {
+    const prev = process.env.QMD_EMBED_MODEL;
+    process.env.QMD_EMBED_MODEL = "hf:env/model.gguf";
+    try {
+      const llm = new LlamaCpp({ embedModel: "hf:config/model.gguf" }) as any;
+      expect(llm.embedModelUri).toBe("hf:config/model.gguf");
+    } finally {
+      if (prev === undefined) delete process.env.QMD_EMBED_MODEL;
+      else process.env.QMD_EMBED_MODEL = prev;
+    }
+  });
+});
+
+describe("LlamaCpp embedding truncation", () => {
+  test("truncates against the active embedding context limit, not the model train context", async () => {
+    const llm = new LlamaCpp({}) as any;
+    const getEmbeddingFor = vi.fn(async (text: string) => ({
+      vector: new Float32Array([0.25, 0.5]),
+      text,
+    }));
+
+    llm.touchActivity = vi.fn();
+    llm.embedModel = {
+      trainContextSize: 8192,
+      tokenize: (text: string) => Array.from({ length: text.length }, () => 1),
+      detokenize: (tokens: readonly number[]) => "x".repeat(tokens.length),
+    };
+    llm.ensureEmbedContext = vi.fn().mockResolvedValue({ getEmbeddingFor });
+
+    const result = await llm.embed("x".repeat(3000));
+
+    expect(getEmbeddingFor).toHaveBeenCalledWith("x".repeat(2044));
+    expect(result).toEqual({
+      embedding: [0.25, 0.5],
+      model: llm.embedModelUri,
+    });
+  });
+});
+
 describe("LlamaCpp rerank deduping", () => {
   test("deduplicates identical document texts before scoring", async () => {
     const llm = new LlamaCpp({}) as any;
@@ -146,6 +249,32 @@ describe("LlamaCpp rerank deduping", () => {
     expect(scoreByFile.get("a.md")).toBe(0.9);
     expect(scoreByFile.get("b.md")).toBe(0.9);
     expect(scoreByFile.get("c.md")).toBe(0.2);
+  });
+});
+
+describe("LlamaCpp.getDeviceInfo", () => {
+  test("can skip build attempts for status probes", async () => {
+    const llm = new LlamaCpp({}) as any;
+    const fakeLlama = {
+      gpu: "metal",
+      supportsGpuOffloading: true,
+      cpuMathCores: 8,
+      getGpuDeviceNames: vi.fn().mockResolvedValue(["Apple GPU"]),
+      getVramState: vi.fn().mockResolvedValue({ total: 1024, used: 256, free: 768 }),
+    };
+
+    llm.ensureLlama = vi.fn().mockResolvedValue(fakeLlama);
+
+    const device = await llm.getDeviceInfo({ allowBuild: false });
+
+    expect(llm.ensureLlama).toHaveBeenCalledWith(false);
+    expect(device).toEqual({
+      gpu: "metal",
+      gpuOffloading: true,
+      gpuDevices: ["Apple GPU"],
+      vram: { total: 1024, used: 256, free: 768 },
+      cpuCores: 8,
+    });
   });
 });
 

@@ -306,10 +306,10 @@ export class RemoteLLM implements LLM {
    * Batch embed multiple texts. Sends all texts in a single API call.
    * Not on the LLM interface but called by store.ts.
    */
-  async embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]> {
+  async embedBatch(texts: string[], options?: EmbedOptions): Promise<(EmbeddingResult | null)[]> {
     if (texts.length === 0) return [];
 
-    const model = this.config.models?.embed || "default";
+    const model = options?.model || this.config.models?.embed || "default";
 
     try {
       const response = await fetchWithRetry(

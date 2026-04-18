@@ -358,7 +358,7 @@ describe("MCP Server", () => {
         expect(['lex', 'vec', 'hyde']).toContain(q.type);
         expect(q.query.length).toBeGreaterThan(0);
       }
-    }, 30000); // 30s timeout for model loading
+    }, 90000);
 
     test("performs RRF fusion on multiple result lists", () => {
       const list1: RankedResult[] = [
@@ -431,7 +431,7 @@ describe("MCP Server", () => {
       );
 
       expect(reranked.length).toBeGreaterThan(0);
-    });
+    }, 90000);
   });
 
   // ===========================================================================

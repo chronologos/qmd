@@ -13,6 +13,7 @@ import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import { spawn } from "child_process";
 import { setTimeout as sleep } from "timers/promises";
+import { buildEditorUri, termLink } from "../src/cli/qmd.ts";
 
 // Test fixtures directory and database path
 let testDir: string;
@@ -836,8 +837,8 @@ describe("CLI ls Command", () => {
   test("lists files in a collection", async () => {
     const { stdout, exitCode } = await runQmd(["ls", "fixtures"], { dbPath: localDbPath });
     expect(exitCode).toBe(0);
-    // handelize converts to lowercase
-    expect(stdout).toContain("qmd://fixtures/readme.md");
+    // handelize preserves original case
+    expect(stdout).toContain("qmd://fixtures/README.md");
     expect(stdout).toContain("qmd://fixtures/notes/meeting.md");
   });
 
@@ -846,8 +847,8 @@ describe("CLI ls Command", () => {
     expect(exitCode).toBe(0);
     expect(stdout).toContain("qmd://fixtures/notes/meeting.md");
     expect(stdout).toContain("qmd://fixtures/notes/ideas.md");
-    // Should not include files outside the prefix (handelize converts to lowercase)
-    expect(stdout).not.toContain("qmd://fixtures/readme.md");
+    // Should not include files outside the prefix (case preserved)
+    expect(stdout).not.toContain("qmd://fixtures/README.md");
   });
 
   test("lists files with virtual path", async () => {
@@ -1129,6 +1130,42 @@ describe("search output formats", () => {
     expect(result.file).not.toMatch(/^\/home\//);
   });
 
+  test("custom-index search links include ?index= and can be passed back to qmd get", async () => {
+    const env = await createIsolatedTestEnv("custom-index-links");
+    const customColl = "fixtures-alt";
+    const customIndex = "release-notes";
+    const customCacheDir = join(testDir, `cache-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+    await mkdir(customCacheDir, { recursive: true });
+
+    const sharedEnv = {
+      INDEX_PATH: "",
+      XDG_CACHE_HOME: customCacheDir,
+    };
+
+    const addResult = await runQmd(
+      ["--index", customIndex, "collection", "add", fixturesDir, "--name", customColl],
+      { dbPath: env.dbPath, configDir: env.configDir, env: sharedEnv }
+    );
+    expect(addResult.exitCode).toBe(0);
+
+    const searchResult = await runQmd(
+      ["--index", customIndex, "search", "test", "--json", "-n", "1"],
+      { dbPath: env.dbPath, configDir: env.configDir, env: sharedEnv }
+    );
+    expect(searchResult.exitCode).toBe(0);
+
+    const results = JSON.parse(searchResult.stdout);
+    const file = results[0]?.file;
+    expect(file).toMatch(new RegExp(`^qmd://${customColl}/.+\\?index=${customIndex}$`));
+
+    const getResult = await runQmd(
+      ["get", file, "-l", "2"],
+      { dbPath: env.dbPath, configDir: env.configDir, env: sharedEnv }
+    );
+    expect(getResult.exitCode).toBe(0);
+    expect(getResult.stdout.trim().length).toBeGreaterThan(0);
+  });
+
   test("search --files includes qmd:// path, docid, and context", async () => {
     const { stdout, exitCode } = await runQmd(["search", "test", "--files", "-n", "1"], { dbPath: localDbPath, configDir: localConfigDir });
     expect(exitCode).toBe(0);
@@ -1174,16 +1211,53 @@ describe("search output formats", () => {
     expect(stdout).not.toMatch(/\/home\//);
   });
 
-  test("search default CLI format includes qmd:// path, docid, and context", async () => {
+  test("search default CLI format includes plain qmd:// path, docid, and context in non-TTY mode", async () => {
     const { stdout, exitCode } = await runQmd(["search", "test", "-n", "1"], { dbPath: localDbPath, configDir: localConfigDir });
     expect(exitCode).toBe(0);
 
-    // First line should have qmd:// path and docid
+    // runQmd uses piped stdio, so stdout is non-TTY and should not contain OSC 8 links.
     expect(stdout).toMatch(new RegExp(`^qmd://${collName}/.*#[a-f0-9]{6}`, "m"));
     expect(stdout).toContain("Context: Test fixtures for QMD");
+    expect(stdout).not.toContain("\x1b]8;;");
     // Ensure no full filesystem paths
     expect(stdout).not.toMatch(/\/Users\//);
     expect(stdout).not.toMatch(/\/home\//);
+  });
+});
+
+describe("editor URI templates", () => {
+  test("buildEditorUri expands path, line, and col placeholders", () => {
+    const uri = buildEditorUri(
+      "vscode://file/{path}:{line}:{col}",
+      "/tmp/my notes/readme.md",
+      42,
+      1,
+    );
+
+    expect(uri).toBe("vscode://file//tmp/my%20notes/readme.md:42:1");
+  });
+
+  test("buildEditorUri supports {column} alias", () => {
+    const uri = buildEditorUri(
+      "cursor://file/{path}:{line}:{column}",
+      "/tmp/docs/api.md",
+      7,
+      3,
+    );
+
+    expect(uri).toBe("cursor://file//tmp/docs/api.md:7:3");
+  });
+
+  test("termLink returns plain text when stdout is not a TTY", () => {
+    const linked = termLink("docs/api.md:12", "vscode://file//tmp/docs/api.md:12:1", false);
+
+    expect(linked).toBe("docs/api.md:12");
+  });
+
+  test("termLink emits OSC 8 hyperlinks when stdout is a TTY", () => {
+    const linked = termLink("docs/api.md:12", "vscode://file//tmp/docs/api.md:12:1", true);
+
+    expect(linked).toBe("\x1b]8;;vscode://file//tmp/docs/api.md:12:1\x07docs/api.md:12\x1b]8;;\x07");
   });
 });
 

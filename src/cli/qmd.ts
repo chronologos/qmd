@@ -45,6 +45,7 @@ import {
   insertContent,
   insertDocument,
   findActiveDocument,
+  findOrMigrateLegacyDocument,
   updateDocumentTitle,
   updateDocument,
   deactivateDocument,
@@ -75,9 +76,10 @@ import {
   generateEmbeddings,
   syncConfigToDb,
   type ReindexResult,
+  type ChunkStrategy,
 } from "../store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "../llm.js";
-import { initLLMProvider } from "../llm-provider.js";
+import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "../llm.js";
+import { initLLMProvider, getActiveBackend } from "../llm-provider.js";
 import { isAnkiCollection, getAnkiCollectionConfig, handleAnkiCommand, handleAnkiCollectionAdd, indexAnkiCollection, formatAnkiCollectionInfo } from "../anki-provider.js";
 import {
   formatSearchResults,
@@ -111,6 +113,7 @@ enableProductionMode();
 
 let store: ReturnType<typeof createStore> | null = null;
 let storeDbPathOverride: string | undefined;
+let currentIndexName = "index";
 
 function getStore(): ReturnType<typeof createStore> {
   if (!store) {
@@ -119,6 +122,15 @@ function getStore(): ReturnType<typeof createStore> {
     try {
       const config = loadConfig();
       syncConfigToDb(store.db, config);
+      // Fork overlay: skip YAML-driven LlamaCpp install when remote backend is active,
+      // otherwise it clobbers the RemoteLLM installed by initLLMProvider().
+      if (config.models && getActiveBackend() !== "remote") {
+        setDefaultLlamaCpp(new LlamaCpp({
+          embedModel: config.models.embed,
+          generateModel: config.models.generate,
+          rerankModel: config.models.rerank,
+        }));
+      }
     } catch {
       // Config may not exist yet — that's fine, DB works without it
     }
@@ -154,6 +166,10 @@ function getDbPath(): string {
   return store?.dbPath ?? storeDbPathOverride ?? getDefaultDbPath();
 }
 
+function getActiveIndexName(): string {
+  return currentIndexName;
+}
+
 function setIndexName(name: string | null): void {
   let normalizedName = name;
   // Normalize relative paths to prevent malformed database paths
@@ -164,6 +180,7 @@ function setIndexName(name: string | null): void {
     // Replace path separators with underscores to create a valid filename
     normalizedName = absolutePath.replace(/\//g, '_').replace(/^_/, '');
   }
+  currentIndexName = normalizedName || "index";
   storeDbPathOverride = normalizedName ? getDefaultDbPath(normalizedName) : undefined;
   // Reset open handle so next use opens the new index
   closeDb();
@@ -375,6 +392,32 @@ async function showStatus(): Promise<void> {
     });
   }
 
+  // AST chunking status
+  try {
+    const { getASTStatus } = await import("../ast.js");
+    const ast = await getASTStatus();
+    console.log(`\n${c.bold}AST Chunking${c.reset}`);
+    if (ast.available) {
+      const ok = ast.languages.filter(l => l.available).map(l => l.language);
+      const fail = ast.languages.filter(l => !l.available);
+      console.log(`  Status:   ${c.green}active${c.reset}`);
+      console.log(`  Languages: ${ok.join(", ")}`);
+      if (fail.length > 0) {
+        for (const f of fail) {
+          console.log(`  ${c.yellow}Unavailable: ${f.language} (${f.error})${c.reset}`);
+        }
+      }
+    } else {
+      console.log(`  Status:   ${c.yellow}unavailable${c.reset} (falling back to regex chunking)`);
+      for (const l of ast.languages) {
+        if (l.error) console.log(`  ${c.dim}${l.language}: ${l.error}${c.reset}`);
+      }
+    }
+  } catch {
+    console.log(`\n${c.bold}AST Chunking${c.reset}`);
+    console.log(`  Status:   ${c.dim}not available${c.reset}`);
+  }
+
   if (collections.length > 0) {
     console.log(`\n${c.bold}Collections${c.reset}`);
     for (const col of collections) {
@@ -430,10 +473,10 @@ async function showStatus(): Promise<void> {
   }
 
   // Device / GPU info
+  console.log(`\n${c.bold}Device${c.reset}`);
   try {
     const llm = getDefaultLlamaCpp();
-    const device = await llm.getDeviceInfo();
-    console.log(`\n${c.bold}Device${c.reset}`);
+    const device = await llm.getDeviceInfo({ allowBuild: false });
     if (device.gpu) {
       console.log(`  GPU:      ${c.green}${device.gpu}${c.reset} (offloading: ${device.gpuOffloading ? 'yes' : 'no'})`);
       if (device.gpuDevices.length > 0) {
@@ -455,8 +498,11 @@ async function showStatus(): Promise<void> {
       console.log(`  ${c.dim}Tip: Install CUDA, Vulkan, or Metal support for GPU acceleration.${c.reset}`);
     }
     console.log(`  CPU:      ${device.cpuCores} math cores`);
-  } catch {
-    // Don't fail status if LLM init fails
+  } catch (error) {
+    console.log(`  Status:   ${c.dim}skipped${c.reset} (status probe does not build llama.cpp backends)`);
+    if (error instanceof Error && error.message) {
+      console.log(`  ${c.dim}${error.message}${c.reset}`);
+    }
   }
 
   // Tips section
@@ -805,8 +851,6 @@ function contextRemove(pathArg: string): void {
 }
 
 function getDocument(filename: string, fromLine?: number, maxLines?: number, lineNumbers?: boolean): void {
-  const db = getDb();
-
   // Parse :linenum suffix from filename (e.g., "file.md:100")
   let inputPath = filename;
   const colonMatch = inputPath.match(/:(\d+)$/);
@@ -817,6 +861,14 @@ function getDocument(filename: string, fromLine?: number, maxLines?: number, lin
       inputPath = inputPath.slice(0, -colonMatch[0].length);
     }
   }
+
+  const parsedIndexPath = isVirtualPath(inputPath) ? parseVirtualPath(inputPath) : null;
+  if (parsedIndexPath?.indexName) {
+    setIndexName(parsedIndexPath.indexName);
+    setConfigIndexName(parsedIndexPath.indexName);
+  }
+
+  const db = getDb();
 
   // Handle docid lookup (#abc123, abc123, "#abc123", "abc123", etc.)
   if (isDocid(inputPath)) {
@@ -829,7 +881,6 @@ function getDocument(filename: string, fromLine?: number, maxLines?: number, lin
       process.exit(1);
     }
   }
-
   let doc: { collectionName: string; path: string; body: string } | null = null;
   let virtualPath: string;
 
@@ -989,7 +1040,7 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
   const db = getDb();
 
   // Check if it's a comma-separated list or a glob pattern
-  const isCommaSeparated = pattern.includes(',') && !pattern.includes('*') && !pattern.includes('?');
+  const isCommaSeparated = pattern.includes(',') && !pattern.includes('*') && !pattern.includes('?') && !pattern.includes('{');
 
   let files: { filepath: string; displayPath: string; bodyLength: number; collection?: string; path?: string }[];
 
@@ -1564,8 +1615,8 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
     const hash = await hashContent(content);
     const title = extractTitle(content, relativeFile);
 
-    // Check if document exists in this collection with this path
-    const existing = findActiveDocument(db, collectionName, path);
+    // Check if document exists (also migrates legacy lowercase paths)
+    const existing = findOrMigrateLegacyDocument(db, collectionName, path);
 
     if (existing) {
       if (existing.hash === hash) {
@@ -1648,10 +1699,17 @@ function parseEmbedBatchOption(name: string, value: unknown): number | undefined
   return parsed;
 }
 
+function parseChunkStrategy(value: unknown): ChunkStrategy | undefined {
+  if (value === undefined) return undefined;
+  const s = String(value);
+  if (s === "auto" || s === "regex") return s;
+  throw new Error(`--chunk-strategy must be "auto" or "regex" (got "${s}")`);
+}
+
 async function vectorIndex(
-  model: string = DEFAULT_EMBED_MODEL,
+  model: string = DEFAULT_EMBED_MODEL_URI,
   force: boolean = false,
-  batchOptions?: { maxDocsPerBatch?: number; maxBatchBytes?: number },
+  batchOptions?: { maxDocsPerBatch?: number; maxBatchBytes?: number; chunkStrategy?: ChunkStrategy },
 ): Promise<void> {
   const storeInstance = getStore();
   const db = storeInstance.db;
@@ -1684,6 +1742,7 @@ async function vectorIndex(
     model,
     maxDocsPerBatch: batchOptions?.maxDocsPerBatch,
     maxBatchBytes: batchOptions?.maxBatchBytes,
+    chunkStrategy: batchOptions?.chunkStrategy,
     onProgress: (info) => {
       if (info.totalBytes === 0) return;
       const percent = (info.bytesProcessed / info.totalBytes) * 100;
@@ -1777,6 +1836,7 @@ type OutputOptions = {
   candidateLimit?: number;  // Max candidates to rerank (default: 40)
   intent?: string;       // Domain intent for disambiguation
   skipRerank?: boolean;  // Skip LLM reranking, use RRF scores only
+  chunkStrategy?: ChunkStrategy;  // "auto" (default) or "regex"
 };
 
 // Highlight query terms in text (skip short words < 3 chars)
@@ -1853,6 +1913,57 @@ type OutputRow = {
   explain?: HybridQueryExplain;
 };
 
+const DEFAULT_EDITOR_URI_TEMPLATE = "vscode://file/{path}:{line}:{col}";
+
+function encodePathForEditorUri(absolutePath: string): string {
+  return encodeURI(absolutePath)
+    .replace(/\?/g, "%3F")
+    .replace(/#/g, "%23");
+}
+
+function getEditorUriTemplate(): string {
+  const envTemplate = process.env.QMD_EDITOR_URI?.trim();
+  if (envTemplate) return envTemplate;
+
+  try {
+    const config = loadConfig() as unknown as {
+      editor_uri?: string;
+      editor_uri_template?: string;
+      editorUri?: string;
+      [key: string]: unknown;
+    };
+    const configTemplate = (
+      config.editor_uri
+      || config.editor_uri_template
+      || config.editorUri
+      || (typeof config["editor-uri"] === "string" ? config["editor-uri"] : undefined)
+    )?.trim();
+
+    if (configTemplate) return configTemplate;
+  } catch {
+    // Ignore config parsing issues and use default template.
+  }
+
+  return DEFAULT_EDITOR_URI_TEMPLATE;
+}
+
+export function buildEditorUri(template: string, absolutePath: string, line: number, col: number): string {
+  const safeLine = Number.isFinite(line) && line > 0 ? Math.floor(line) : 1;
+  const safeCol = Number.isFinite(col) && col > 0 ? Math.floor(col) : 1;
+  const encodedPath = encodePathForEditorUri(absolutePath);
+
+  return template
+    .replace(/\{path\}/g, encodedPath)
+    .replace(/\{line\}/g, String(safeLine))
+    .replace(/\{col\}/g, String(safeCol))
+    .replace(/\{column\}/g, String(safeCol));
+}
+
+export function termLink(text: string, url: string, isTTY: boolean = !!process.stdout.isTTY): string {
+  if (!isTTY) return text;
+  return `\x1b]8;;${url}\x07${text}\x1b]8;;\x07`;
+}
+
 function outputResults(results: OutputRow[], query: string, opts: OutputOptions): void {
   const filtered = results.filter(r => r.score >= opts.minScore).slice(0, opts.limit);
 
@@ -1862,14 +1973,26 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
   }
 
   // Helper to create qmd:// URI from displayPath
-  const toQmdPath = (displayPath: string) => `qmd://${displayPath}`;
+  const toQmdPath = (displayPath: string) => {
+    const [collectionName, ...segments] = displayPath.split("/");
+    if (!collectionName || segments.length === 0) {
+      return `qmd://${displayPath}`;
+    }
+    const indexName = getActiveIndexName();
+    return buildVirtualPath(
+      collectionName,
+      segments.join("/"),
+      indexName === "index" ? undefined : indexName,
+    );
+  };
 
   if (opts.format === "json") {
     // JSON output for LLM consumption
     const output = filtered.map(row => {
       const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : undefined);
       let body = opts.full ? row.body : undefined;
-      let snippet = !opts.full ? extractSnippet(row.body, query, 300, row.chunkPos, undefined, opts.intent).snippet : undefined;
+      const snippetInfo = !opts.full ? extractSnippet(row.body, query, 300, row.chunkPos, undefined, opts.intent) : undefined;
+      let snippet = snippetInfo?.snippet;
       if (opts.lineNumbers) {
         if (body) body = addLineNumbers(body);
         if (snippet) snippet = addLineNumbers(snippet);
@@ -1878,6 +2001,7 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
         ...(docid && { docid: `#${docid}` }),
         score: Math.round(row.score * 100) / 100,
         file: toQmdPath(row.displayPath),
+        ...(snippetInfo && { line: snippetInfo.line }),
         title: row.title,
         ...(row.context && { context: row.context }),
         ...(body && { body }),
@@ -1894,6 +2018,9 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
       console.log(`#${docid},${row.score.toFixed(2)},${toQmdPath(row.displayPath)}${ctx}`);
     }
   } else if (opts.format === "cli") {
+    const editorUriTemplate = getEditorUriTemplate();
+    const linkDb = getDb();
+
     for (let i = 0; i < filtered.length; i++) {
       const row = filtered[i];
       if (!row) continue;
@@ -1901,13 +2028,27 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
       const docid = row.docid || (row.hash ? row.hash.slice(0, 6) : undefined);
 
       // Line 1: filepath with docid
-      const path = toQmdPath(row.displayPath);
+      const virtualPath = row.file.startsWith("qmd://") ? row.file : toQmdPath(row.displayPath);
+      const parsed = parseVirtualPath(virtualPath);
+      const absolutePath = resolveVirtualPath(linkDb, virtualPath);
+
+      const legacyPath = toQmdPath(row.displayPath);
+      const displayPath = parsed?.path || row.displayPath;
+
       // Only show :line if we actually found a term match in the snippet body (exclude header line).
       const snippetBody = snippet.split("\n").slice(1).join("\n").toLowerCase();
       const hasMatch = query.toLowerCase().split(/\s+/).some(t => t.length > 0 && snippetBody.includes(t));
       const lineInfo = hasMatch ? `:${line}` : "";
       const docidStr = docid ? ` ${c.dim}#${docid}${c.reset}` : "";
-      console.log(`${c.cyan}${path}${c.dim}${lineInfo}${c.reset}${docidStr}`);
+
+      if (process.stdout.isTTY && absolutePath && parsed?.path) {
+        const linkLine = hasMatch ? line : 1;
+        const linkTarget = buildEditorUri(editorUriTemplate, absolutePath, linkLine, 1);
+        const clickable = termLink(`${displayPath}${lineInfo}`, linkTarget);
+        console.log(`${c.cyan}${clickable}${c.reset}${docidStr}`);
+      } else {
+        console.log(`${c.cyan}${legacyPath}${c.dim}${lineInfo}${c.reset}${docidStr}`);
+      }
 
       // Line 2: Title (if available)
       if (row.title) {
@@ -2262,6 +2403,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
         skipRerank: opts.skipRerank,
         explain: !!opts.explain,
         intent,
+        chunkStrategy: opts.chunkStrategy,
         hooks: {
           onEmbedStart: (count) => {
             process.stderr.write(`${c.dim}Embedding ${count} ${count === 1 ? 'query' : 'queries'}...${c.reset}`);
@@ -2289,6 +2431,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
         skipRerank: opts.skipRerank,
         explain: !!opts.explain,
         intent,
+        chunkStrategy: opts.chunkStrategy,
         hooks: {
           onStrongSignal: (score) => {
             process.stderr.write(`${c.dim}Strong BM25 signal (${score.toFixed(2)}) — skipping expansion${c.reset}\n`);
@@ -2403,6 +2546,8 @@ function parseCLI() {
       "candidate-limit": { type: "string", short: "C" },
       "no-rerank": { type: "boolean", default: false },
       intent: { type: "string" },
+      // Chunking options
+      "chunk-strategy": { type: "string" },  // "regex" (default) or "auto" (AST for code files)
       // MCP HTTP transport options
       http: { type: "boolean" },
       daemon: { type: "boolean" },
@@ -2461,6 +2606,7 @@ function parseCLI() {
     skipRerank: !!values["no-rerank"],
     explain: !!values.explain,
     intent: values.intent as string | undefined,
+    chunkStrategy: parseChunkStrategy(values["chunk-strategy"]),
   };
 
   return {
@@ -2613,6 +2759,7 @@ function showHelp(): void {
   console.log("  qmd multi-get <pattern>       - Batch fetch via glob or comma-separated list");
   console.log("  qmd skill show/install        - Show or install the packaged QMD skill");
   console.log("  qmd mcp                       - Start the MCP server (stdio transport for AI agents)");
+  console.log("  qmd bench <fixture.json>      - Run search quality benchmarks against a fixture file");
   console.log("");
   console.log("Collections & context:");
   console.log("  qmd collection add/list/remove/rename/show   - Manage indexed folders");
@@ -2675,6 +2822,7 @@ function showHelp(): void {
   console.log("");
   console.log("Global options:");
   console.log("  --index <name>             - Use a named index (default: index)");
+  console.log("  QMD_EDITOR_URI             - Editor link template for clickable TTY search output");
   console.log("");
   console.log("Search options:");
   console.log("  -n <num>                   - Max results (default 5, or 20 for --files/--json)");
@@ -2687,6 +2835,9 @@ function showHelp(): void {
   console.log("  --explain                  - Include retrieval score traces (query --json/CLI)");
   console.log("  --files | --json | --csv | --md | --xml  - Output format");
   console.log("  -c, --collection <name>    - Filter by one or more collections");
+  console.log("");
+  console.log("Embed/query options:");
+  console.log("  --chunk-strategy <auto|regex> - Chunking mode (default: regex; auto uses AST for code files)");
   console.log("");
   console.log("Multi-get options:");
   console.log("  -l <num>                   - Maximum lines per file");
@@ -3031,9 +3182,11 @@ if (isMain) {
       try {
         const maxDocsPerBatch = parseEmbedBatchOption("maxDocsPerBatch", cli.values["max-docs-per-batch"]);
         const maxBatchMb = parseEmbedBatchOption("maxBatchBytes", cli.values["max-batch-mb"]);
-        await vectorIndex(DEFAULT_EMBED_MODEL, !!cli.values.force, {
+        const embedChunkStrategy = parseChunkStrategy(cli.values["chunk-strategy"]);
+        await vectorIndex(DEFAULT_EMBED_MODEL_URI, !!cli.values.force, {
           maxDocsPerBatch,
           maxBatchBytes: maxBatchMb === undefined ? undefined : maxBatchMb * 1024 * 1024,
+          chunkStrategy: embedChunkStrategy,
         });
       } catch (error) {
         console.error(error instanceof Error ? error.message : String(error));
@@ -3090,6 +3243,24 @@ if (isMain) {
       }
       await querySearch(cli.query, cli.opts);
       break;
+
+    case "bench": {
+      const fixturePath = cli.args[0];
+      if (!fixturePath) {
+        console.error("Usage: qmd bench <fixture.json> [--json] [-c collection]");
+        console.error("");
+        console.error("Run search quality benchmarks against a fixture file.");
+        console.error("See src/bench/fixtures/example.json for the fixture format.");
+        process.exit(1);
+      }
+      const { runBenchmark } = await import("../bench/bench.js");
+      const benchCollection = cli.opts.collection;
+      await runBenchmark(fixturePath, {
+        json: !!(cli.opts as { json?: boolean }).json,
+        collection: Array.isArray(benchCollection) ? benchCollection[0] : benchCollection,
+      });
+      break;
+    }
 
     case "mcp": {
       const sub = cli.args[0]; // stop | status | undefined
