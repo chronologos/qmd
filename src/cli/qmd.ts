@@ -81,6 +81,8 @@ import {
   type ChunkStrategy,
 } from "../store.js";
 import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
+import { initLLMProvider, getActiveBackend } from "../llm-provider.js";
+import { isAnkiCollection, getAnkiCollectionConfig, handleAnkiCommand, handleAnkiCollectionAdd, indexAnkiCollection, formatAnkiCollectionInfo } from "../anki-provider.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -133,11 +135,15 @@ function getStore(): ReturnType<typeof createStore> {
       const activeModels = ensureModelsConfiguredForCli();
       const config = loadConfig();
       syncConfigToDb(store.db, config);
-      setDefaultLlamaCpp(new LlamaCpp({
-        embedModel: activeModels.embed,
-        generateModel: activeModels.generate,
-        rerankModel: activeModels.rerank,
-      }));
+      // Fork overlay: skip the YAML-driven LlamaCpp install when the remote backend
+      // is active, otherwise it clobbers the RemoteLLM installed by initLLMProvider().
+      if (getActiveBackend() !== "remote") {
+        setDefaultLlamaCpp(new LlamaCpp({
+          embedModel: activeModels.embed,
+          generateModel: activeModels.generate,
+          rerankModel: activeModels.rerank,
+        }));
+      }
     } catch {
       // Config may not exist yet — that's fine, DB works without it
     }
@@ -207,6 +213,7 @@ const c = {
   green: useColor ? "\x1b[32m" : "",
   magenta: useColor ? "\x1b[35m" : "",
   blue: useColor ? "\x1b[34m" : "",
+  red: useColor ? "\x1b[31m" : "",
 };
 
 // Terminal cursor control
@@ -677,6 +684,24 @@ async function updateCollections(): Promise<void> {
   for (let i = 0; i < collections.length; i++) {
     const col = collections[i];
     if (!col) continue;
+
+    // Anki collections are indexed differently (fork-only)
+    if (isAnkiCollection(col.name)) {
+      console.log(`${c.cyan}[${i + 1}/${collections.length}]${c.reset} ${c.bold}${col.name}${c.reset} ${c.dim}(source: anki)${c.reset}`);
+      const ankiConfig = getAnkiCollectionConfig(col.name);
+      if (ankiConfig) {
+        // Re-acquire db handle — indexFiles() closes it after each collection
+        const ankiDb = getDb();
+        const result = await indexAnkiCollection(ankiDb, col.name, ankiConfig, (msg) => {
+          process.stderr.write(`\r  ${msg}        `);
+        });
+        process.stderr.write("\r" + " ".repeat(60) + "\r");
+        console.log(`  ${c.green}✓${c.reset} ${result.indexed} new, ${result.updated} updated, ${result.removed} removed, ${result.unchanged} unchanged`);
+      }
+      console.log("");
+      continue;
+    }
+
     console.log(`${c.cyan}[${i + 1}/${collections.length}]${c.reset} ${c.bold}${col.name}${c.reset} ${c.dim}(${col.glob_pattern})${c.reset}`);
 
     // Execute custom update command if specified in YAML
@@ -1541,7 +1566,17 @@ function collectionList(): void {
   for (const coll of collections) {
     const updatedAt = coll.last_modified ? new Date(coll.last_modified) : new Date();
     const timeAgo = formatTimeAgo(updatedAt);
-    
+
+    // Anki collections display differently (fork-only)
+    if (isAnkiCollection(coll.name)) {
+      const ankiConfig = getAnkiCollectionConfig(coll.name);
+      if (ankiConfig) {
+        console.log(formatAnkiCollectionInfo(coll.name, ankiConfig, coll.active_count, coll.last_modified, c));
+        console.log();
+        continue;
+      }
+    }
+
     // Get YAML config to check includeByDefault
     const yamlColl = getCollectionFromYaml(coll.name);
     const excluded = yamlColl?.includeByDefault === false;
@@ -2772,6 +2807,15 @@ function parseCLI() {
       daemon: { type: "boolean" },
       port: { type: "string" },
       host: { type: "string" },
+      // Remote LLM options (fork-only)
+      remote: { type: "boolean" },
+      local: { type: "boolean" },
+      "remote-url": { type: "string" },
+      // Anki collection options (fork-only)
+      anki: { type: "boolean" },
+      deck: { type: "string", multiple: true },
+      "note-type": { type: "string", multiple: true },
+      tag: { type: "string", multiple: true },
     },
     allowPositionals: true,
     strict: false, // Allow unknown options to pass through
@@ -2798,6 +2842,14 @@ function parseCLI() {
       setConfigSource();
     }
   }
+
+  // Initialize LLM provider (remote or local) — fork-only
+  initLLMProvider({
+    forceLocal: !!values.local,
+    forceRemote: !!values.remote,
+    remoteUrl: values["remote-url"] as string | undefined,
+    indexName: indexName || "index",
+  });
 
   // Determine output format. Prefer --format <kind>; fall back to the
   // legacy boolean aliases (--csv/--md/--xml/--files/--json) which remain
@@ -3280,6 +3332,11 @@ function showHelp(): void {
   console.log("  qmd collection add/list/remove/rename/show   - Manage indexed folders");
   console.log("  qmd context add/list/rm                      - Attach human-written summaries");
   console.log("  qmd ls [collection[/path]]                   - Inspect indexed files");
+  console.log("");
+  console.log("Anki (fork-only):");
+  console.log("  qmd anki test                 - Test AnkiConnect connection");
+  console.log("  qmd anki decks                - List available Anki decks");
+  console.log("  qmd collection add --anki --name <name> [--deck <d>]  - Create Anki collection");
   console.log("");
   console.log("Maintenance:");
   console.log("  qmd init                      - Create a project-local .qmd index");
@@ -4142,6 +4199,23 @@ if (isMain) {
         }
 
         case "add": {
+          // Anki collection (fork-only)
+          if (cli.values.anki) {
+            const ankiName = cli.values.name as string;
+            if (!ankiName) {
+              console.error("Usage: qmd collection add --anki --name <name> [--deck <deck>] [--note-type <type>] [--tag <tag>]");
+              process.exit(1);
+            }
+            const db = getDb();
+            await handleAnkiCollectionAdd(ankiName, {
+              decks: cli.values.deck as string[] | undefined,
+              noteTypes: cli.values["note-type"] as string[] | undefined,
+              tags: cli.values.tag as string[] | undefined,
+            }, db, c);
+            closeDb();
+            break;
+          }
+
           const pwd = cli.args[1] || getPwd();
           const resolvedPwd = pwd === '.' ? getPwd() : getRealPath(resolve(pwd));
           const globPattern = cli.values.mask as string || DEFAULT_GLOB;
@@ -4281,6 +4355,10 @@ if (isMain) {
       } catch (error) {
         exitWithError(error);
       }
+      break;
+
+    case "anki":
+      await handleAnkiCommand(cli.args, c);
       break;
 
     case "status":

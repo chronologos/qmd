@@ -31,6 +31,7 @@ import {
 } from "../index.js";
 import { getConfigPath } from "../collections.js";
 import { enableProductionMode } from "../store.js";
+import { initLLMProvider } from "../llm-provider.js";
 
 // =============================================================================
 // Types for structured content
@@ -588,6 +589,11 @@ export async function startMcpServer(options: McpStartupOptions = {}): Promise<v
   // isolation for downstream suites that expect the default (development)
   // database path behaviour.
   enableProductionMode();
+  // Install the remote backend (if configured) before creating the store, so the
+  // store binds to the RemoteLLM. Idempotent: when launched via `qmd mcp`, the CLI
+  // already called this (honoring --local/--remote); this only matters when the
+  // server module is run directly (server.ts main guard), bypassing the CLI.
+  initLLMProvider();
   const configPath = getConfigPath();
   const store = await createStore({
     dbPath: options.dbPath ?? getDefaultDbPath(),
@@ -622,6 +628,7 @@ export async function startMcpHttpServer(
   // HTTP transport resolves the real database path, without leaking state into
   // callers that only import this module for its exports (e.g. tests).
   enableProductionMode();
+  initLLMProvider(); // see startMcpServer — install remote backend before the store binds
   const configPath = getConfigPath();
   const store = await createStore({
     dbPath: options.dbPath ?? getDefaultDbPath(),

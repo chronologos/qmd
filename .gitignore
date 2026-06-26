@@ -12,9 +12,12 @@ texts/
 !README.md
 !CLAUDE.md
 !CHANGELOG.md
+!MERGE_UPSTREAM.md
 !skills/**/*.md
 !finetune/*.md
 !docs/*.md
 finetune/outputs/
 finetune/data/train/
 .claude/
+__pycache__/
+*.pyc

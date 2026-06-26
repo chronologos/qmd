@@ -128,6 +128,11 @@ export function openDatabase(path: string): Database {
 export interface Database {
   exec(sql: string): void;
   prepare(sql: string): Statement;
+  /**
+   * Wrap a function so it runs inside a transaction, returning a callable with
+   * the same signature. Supported by both better-sqlite3 and bun:sqlite.
+   */
+  transaction<A extends any[], R>(fn: (...args: A) => R): (...args: A) => R;
   loadExtension(path: string): void;
   transaction<T extends (...args: SQLiteValue[]) => unknown>(fn: T): T;
   close(): void;

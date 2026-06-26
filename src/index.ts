@@ -67,7 +67,9 @@ import {
 } from "./store.js";
 import {
   LlamaCpp,
+  getDefaultLlamaCpp,
 } from "./llm.js";
+import { getActiveBackend } from "./llm-provider.js";
 import {
   setConfigSource,
   loadConfig,
@@ -374,14 +376,25 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
 
   // Create a per-store LlamaCpp instance — lazy-loads models on first use,
   // auto-unloads after 5 min inactivity to free VRAM.
-  const llm = new LlamaCpp({
-    embedModel: config?.models?.embed,
-    generateModel: config?.models?.generate,
-    rerankModel: config?.models?.rerank,
-    inactivityTimeoutMs: 5 * 60 * 1000,
-    disposeModelsOnInactivity: true,
-  });
-  internal.llm = llm;
+  //
+  // Fork overlay: skip the per-store LOCAL LlamaCpp when a remote backend is active
+  // (installed by initLLMProvider). getLlm() prefers store.llm over the global default,
+  // so a local instance here SHADOWS the RemoteLLM and embeds queries with the local
+  // 768-dim model — a dimension mismatch against a remote-built (2560-dim) index. This
+  // mirrors the guard in the CLI's getStore(); leaving internal.llm unset lets getLlm()
+  // fall through to getDefaultLlamaCpp() (the RemoteLLM). (Note: this YAML nests models
+  // under `remote:`, so config.models is undefined here and a local LlamaCpp would
+  // silently default to embeddinggemma-300M = 768d.)
+  if (getActiveBackend() !== "remote") {
+    const llm = new LlamaCpp({
+      embedModel: config?.models?.embed,
+      generateModel: config?.models?.generate,
+      rerankModel: config?.models?.rerank,
+      inactivityTimeoutMs: 5 * 60 * 1000,
+      disposeModelsOnInactivity: true,
+    });
+    internal.llm = llm;
+  }
 
   const store: QMDStore = {
     internal,
@@ -426,7 +439,10 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
       });
     },
     searchLex: async (q, opts) => internal.searchFTS(q, opts?.limit, opts?.collection),
-    searchVector: async (q, opts) => internal.searchVec(q, llm.embedModelName, opts?.limit, opts?.collection),
+    // Mirror getLlm(): prefer the per-store LlamaCpp, else the global default
+    // (the RemoteLLM when a remote backend is active). `llm` above is block-scoped
+    // to the non-remote branch, so resolve the active backend here instead.
+    searchVector: async (q, opts) => internal.searchVec(q, (internal.llm ?? getDefaultLlamaCpp()).embedModelName, opts?.limit, opts?.collection),
     expandQuery: async (q, opts) => internal.expandQuery(q, undefined, opts?.intent),
     get: async (pathOrDocid, opts) => internal.findDocument(pathOrDocid, opts),
     getDocumentBody: async (pathOrDocid, opts) => {
@@ -539,7 +555,9 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
 
     // Lifecycle
     close: async () => {
-      await llm.dispose();
+      // Only a store-owned LOCAL LlamaCpp is disposed here; when the remote backend is
+      // active there is no per-store instance (the shared RemoteLLM is disposed globally).
+      await internal.llm?.dispose();
       internal.close();
       if (hasYamlConfig || options.config) {
         setConfigSource(undefined); // Reset config source
