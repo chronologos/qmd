@@ -175,12 +175,18 @@ def deploy_vllm(model: str | None = None, force: bool = False) -> None:
         "--ulimit", "stack=67108864",
         "-e", "NVIDIA_DISABLE_REQUIRE=1",  # Enable CUDA forward compatibility
         "-e", "HF_HUB_DOWNLOAD_TIMEOUT=30",  # fail fast on stalled CDN reads (default hangs)
+        "-e", "PYTHONUNBUFFERED=1",  # flush startup logs (default buffers, hides progress)
         "-p", f"127.0.0.1:{VLLM_PORT}:{VLLM_PORT}",
         "-v", f"{Path.home()}/.cache/huggingface:/root/.cache/huggingface",
         VLLM_IMAGE,
         "vllm", "serve", model,
         "--gpu-memory-utilization", str(VLLM_GPU_MEMORY_UTILIZATION),
         "--port", str(VLLM_PORT),
+        # This image targets NVIDIA driver >=590.44; the DGX is on 580.x. The
+        # torch.compile + CUDA-graph capture path hangs on the older driver
+        # (0% GPU, no progress). Eager mode skips it — negligible cost for the
+        # low-volume query-expansion workload. Drop once the driver is updated.
+        "--enforce-eager",
     ])
     print(f"  - Container '{VLLM_CONTAINER_NAME}' created and started")
 
