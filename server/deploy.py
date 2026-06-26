@@ -48,12 +48,18 @@ VENV_DIR = DEPLOY_DIR / ".venv"
 EMBED_SERVICE_NAME = "qmd-embed"
 EMBED_SERVICE_FILE = Path(f"/etc/systemd/system/{EMBED_SERVICE_NAME}.service")
 EMBED_PORT = 8001
+# Default-equivalent stack: mirror qmd's local GGUF defaults with their HF sources.
+# embeddinggemma-300m is a GATED model — accept the license at
+# https://huggingface.co/google/embeddinggemma-300m and `hf auth login` (as the
+# service user) before deploying, or the embed service will fail to download it.
+EMBED_MODEL = "google/embeddinggemma-300m"
+RERANK_MODEL = "Qwen/Qwen3-Reranker-0.6B"
 
 # vLLM container config
 VLLM_CONTAINER_NAME = "qmd-vllm"
 VLLM_IMAGE = "nvcr.io/nvidia/vllm:25.12.post1-py3"
 VLLM_PORT = 8000
-VLLM_DEFAULT_MODEL = "Qwen/Qwen3-4B"
+VLLM_DEFAULT_MODEL = "Qwen/Qwen3-1.7B"
 VLLM_GPU_MEMORY_UTILIZATION = 0.3  # Leave room for embed/rerank on same GPU
 
 
@@ -266,6 +272,8 @@ Group={sudo_user}
 WorkingDirectory={DEPLOY_DIR}
 Environment="PATH={VENV_DIR}/bin:/usr/local/bin:/usr/bin:/bin"
 Environment="MAX_BATCH_SIZE=64"
+Environment="EMBED_MODEL={EMBED_MODEL}"
+Environment="RERANK_MODEL={RERANK_MODEL}"
 
 # Start uvicorn
 ExecStart={VENV_DIR}/bin/uvicorn embed_rerank:app --host 127.0.0.1 --port {EMBED_PORT}
