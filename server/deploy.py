@@ -174,6 +174,7 @@ def deploy_vllm(model: str | None = None, force: bool = False) -> None:
         "--ulimit", "memlock=-1",
         "--ulimit", "stack=67108864",
         "-e", "NVIDIA_DISABLE_REQUIRE=1",  # Enable CUDA forward compatibility
+        "-e", "HF_HUB_DOWNLOAD_TIMEOUT=30",  # fail fast on stalled CDN reads (default hangs)
         "-p", f"127.0.0.1:{VLLM_PORT}:{VLLM_PORT}",
         "-v", f"{Path.home()}/.cache/huggingface:/root/.cache/huggingface",
         VLLM_IMAGE,
@@ -274,6 +275,11 @@ Environment="PATH={VENV_DIR}/bin:/usr/local/bin:/usr/bin:/bin"
 Environment="MAX_BATCH_SIZE=64"
 Environment="EMBED_MODEL={EMBED_MODEL}"
 Environment="RERANK_MODEL={RERANK_MODEL}"
+# Fail fast on stalled HF CDN reads (default hangs forever) and avoid the
+# hf_transfer fast-path, which stalls without a usable timeout. huggingface_hub
+# retries with resume after a timeout, so transient CDN stalls self-heal.
+Environment="HF_HUB_DOWNLOAD_TIMEOUT=30"
+Environment="HF_HUB_ENABLE_HF_TRANSFER=0"
 
 # Start uvicorn
 ExecStart={VENV_DIR}/bin/uvicorn embed_rerank:app --host 127.0.0.1 --port {EMBED_PORT}
