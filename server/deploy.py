@@ -60,7 +60,12 @@ VLLM_CONTAINER_NAME = "qmd-vllm"
 VLLM_IMAGE = "nvcr.io/nvidia/vllm:25.12.post1-py3"
 VLLM_PORT = 8000
 VLLM_DEFAULT_MODEL = "Qwen/Qwen3-1.7B"
-VLLM_GPU_MEMORY_UTILIZATION = 0.3  # Leave room for embed/rerank on same GPU
+# Query-expansion runs a 1.7B model — it needs almost no KV cache, but vLLM
+# pre-reserves gpu_memory_utilization * total_unified_mem at startup regardless
+# of model size. On the GB10's 121 GiB unified pool, 0.3 reserved ~36 GiB (~33
+# of it idle KV blocks). Kept low so a co-resident agent model (qwen35b-agent)
+# has room. Raise only if query expansion needs more concurrency.
+VLLM_GPU_MEMORY_UTILIZATION = 0.12  # ~15 GiB on the 121 GiB GB10 pool
 
 
 # =============================================================================

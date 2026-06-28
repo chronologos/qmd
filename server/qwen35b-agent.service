@@ -1,0 +1,41 @@
+[Unit]
+Description=Qwen3.6-35B-A3B agent (vLLM NVFP4, port 8002) for Hermes
+Documentation=https://build.nvidia.com/spark/vllm/agent-ready-qwen35b
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=10
+# vLLM loads ~22GB of NVFP4 weights in eager mode; give startup plenty of room.
+TimeoutStartSec=900
+TimeoutStopSec=120
+
+# Own the container lifecycle entirely: clear any stale instance, then run in the
+# foreground (no -d, with --rm) so systemd tracks the docker client and restarts
+# on exit. Config lives only here — edit this unit, not a detached `docker run`.
+ExecStartPre=-/usr/bin/docker rm -f qwen35b-agent
+ExecStart=/usr/bin/docker run --rm --name qwen35b-agent \
+    --gpus all \
+    --ipc=host \
+    --ulimit memlock=-1 \
+    --ulimit stack=67108864 \
+    -e HF_HUB_OFFLINE=1 \
+    -p 127.0.0.1:8002:8002 \
+    -v /home/iantay/.cache/huggingface:/root/.cache/huggingface \
+    vllm/vllm-openai:nightly \
+        nvidia/Qwen3.6-35B-A3B-NVFP4 \
+        --port 8002 \
+        --gpu-memory-utilization 0.45 \
+        --kv-cache-dtype fp8 \
+        --max-model-len 65536 \
+        --reasoning-parser qwen3 \
+        --tool-call-parser qwen3_xml \
+        --enable-auto-tool-choice \
+        --enforce-eager
+ExecStop=/usr/bin/docker stop -t 60 qwen35b-agent
+
+[Install]
+WantedBy=multi-user.target
