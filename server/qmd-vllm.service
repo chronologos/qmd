@@ -1,0 +1,39 @@
+[Unit]
+Description=qmd query-expansion LLM (vLLM Qwen3-1.7B, port 8000)
+Documentation=https://github.com/chronologos/qmd/blob/main/server/README.md
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=10
+# Small model, but eager-mode load + shared 121 GiB unified pool can be slow
+# under memory pressure; give startup room.
+TimeoutStartSec=600
+TimeoutStopSec=120
+
+# Own the container lifecycle entirely: clear any stale instance, then run in the
+# foreground (no -d, with --rm) so systemd tracks the docker client and restarts
+# on exit. Config lives only here — edit this unit, not a detached `docker run`.
+# --gpu-memory-utilization 0.12 (~14 GiB of the 121 GiB unified pool) is chosen to
+# coexist with qwen35b-agent (0.45) and qmd-embed; do not raise without rebalancing.
+ExecStartPre=-/usr/bin/docker rm -f qmd-vllm
+ExecStart=/usr/bin/docker run --rm --name qmd-vllm \
+    --gpus all \
+    --ipc=host \
+    --ulimit memlock=-1 \
+    --ulimit stack=67108864 \
+    -e HF_HUB_OFFLINE=1 \
+    -p 127.0.0.1:8000:8000 \
+    -v /home/iantay/.cache/huggingface:/root/.cache/huggingface \
+    nvcr.io/nvidia/vllm:25.12.post1-py3 \
+        vllm serve Qwen/Qwen3-1.7B \
+        --port 8000 \
+        --gpu-memory-utilization 0.12 \
+        --enforce-eager
+ExecStop=/usr/bin/docker stop -t 60 qmd-vllm
+
+[Install]
+WantedBy=multi-user.target

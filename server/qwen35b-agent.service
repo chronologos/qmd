@@ -30,7 +30,7 @@ ExecStart=/usr/bin/docker run --rm --name qwen35b-agent \
         --port 8002 \
         --gpu-memory-utilization 0.45 \
         --kv-cache-dtype fp8 \
-        --max-model-len 65536 \
+        --max-model-len 262144 \
         --reasoning-parser qwen3 \
         --tool-call-parser qwen3_xml \
         --enable-auto-tool-choice \
