@@ -70,6 +70,39 @@ import {
   getDefaultLlamaCpp,
 } from "./llm.js";
 import { getActiveBackend } from "./llm-provider.js";
+import type {
+  DocumentMetadata,
+  MetadataScalar,
+  MetadataScalarArray,
+  MetadataValue,
+  MetadataValueType,
+} from "./metadata.js";
+import {
+  parseMetadataFilter,
+  parseMetadataMatch,
+  MetadataFilterError,
+  type MetadataFilter,
+  type MetadataFilterGroup,
+  type MetadataFilterNegation,
+  type MetadataCondition,
+  type MetadataPredicate,
+  type MetadataPredicateGroup,
+  type MetadataPredicateNegation,
+  type MetadataMatch,
+  type MetadataEntryCondition,
+  type MetadataEntryField,
+} from "./metadata-filter.js";
+import {
+  listMetadata as storeListMetadata,
+  MetadataBindingBudgetError,
+  MetadataOptionError,
+  type ListMetadataOptions,
+  type ListMetadataResult,
+  type MetadataKeySummary,
+  type MetadataKeyTypeSummary,
+  type MetadataValueCount,
+  type MetadataKeyOverview,
+} from "./metadata-store.js";
 import {
   setConfigSource,
   loadConfig,
@@ -111,6 +144,37 @@ export type {
   ContextMap,
 };
 
+// Re-export metadata and metadata-filter types shared by every search surface
+export type {
+  DocumentMetadata,
+  MetadataScalar,
+  MetadataScalarArray,
+  MetadataValue,
+  MetadataValueType,
+  MetadataFilter,
+  MetadataFilterGroup,
+  MetadataFilterNegation,
+  MetadataCondition,
+  MetadataPredicate,
+  MetadataPredicateGroup,
+  MetadataPredicateNegation,
+  MetadataMatch,
+  MetadataEntryCondition,
+  MetadataEntryField,
+};
+export { parseMetadataFilter, parseMetadataMatch, MetadataFilterError };
+
+// Re-export metadata discovery types (listMetadata() and status metadata keys)
+export type {
+  ListMetadataOptions,
+  ListMetadataResult,
+  MetadataKeySummary,
+  MetadataKeyTypeSummary,
+  MetadataValueCount,
+  MetadataKeyOverview,
+};
+export { MetadataBindingBudgetError, MetadataOptionError };
+
 // Re-export the internal Store type for advanced consumers
 export type { InternalStore };
 
@@ -143,6 +207,7 @@ export type UpdateResult = {
   updated: number;
   unchanged: number;
   removed: number;
+  skipped: number;
   needsEmbedding: number;
 };
 
@@ -154,7 +219,7 @@ export interface SearchOptions {
   query?: string;
   /** Pre-expanded queries (from expandQuery) — skips auto-expansion */
   queries?: ExpandedQuery[];
-  /** Domain intent hint — steers expansion and reranking */
+  /** Domain intent hint — steers reranking and snippet/chunk selection */
   intent?: string;
   /** Rerank results using LLM (default: true) */
   rerank?: boolean;
@@ -162,6 +227,8 @@ export interface SearchOptions {
   collection?: string;
   /** Filter to specific collections */
   collections?: string[];
+  /** Metadata filter — every returned result satisfies it */
+  filter?: MetadataFilter;
   /** Max results (default: 10) */
   limit?: number;
   /** Max candidates to rerank (default: 40) */
@@ -179,7 +246,9 @@ export interface SearchOptions {
  */
 export interface LexSearchOptions {
   limit?: number;
-  collection?: string;
+  collection?: string | string[];
+  /** Metadata filter — every returned result satisfies it */
+  filter?: MetadataFilter;
 }
 
 /**
@@ -187,13 +256,21 @@ export interface LexSearchOptions {
  */
 export interface VectorSearchOptions {
   limit?: number;
-  collection?: string;
+  collection?: string | string[];
+  /** Metadata filter — every returned result satisfies it */
+  filter?: MetadataFilter;
 }
 
 /**
  * Options for expandQuery() — manual query expansion.
  */
 export interface ExpandQueryOptions {
+  /**
+   * @deprecated Ignored. Intent no longer feeds the expansion model — caller
+   * intent is meta-language the model reproduced verbatim as sub-queries.
+   * Pass intent via SearchOptions instead, where it shapes reranking and
+   * snippet selection.
+   */
   intent?: string;
 }
 
@@ -264,6 +341,22 @@ export interface QMDStore {
 
   /** List all collections with document stats */
   listCollections(): Promise<{ name: string; pwd: string; glob_pattern: string; doc_count: number; active_count: number; last_modified: string | null; includeByDefault: boolean }[]>;
+
+  /**
+   * Discover metadata keys, types, and value counts across the documents in
+   * scope. `filter` selects which documents are counted. `match` selects
+   * which of their metadata entries are reported, with the filter grammar
+   * evaluated against each entry (a condition's `field` is the entry's `key` or
+   * `value`). Keys and values are windowed by `keyLimit`/`keyOffset` and
+   * `valueLimit`/`valueOffset`, and the result carries the totals and
+   * remainders needed to page. Every value reported is one an `eq` filter can
+   * match under the same scope, and the whole result comes from one database
+   * snapshot. Throws MetadataFilterError for an invalid predicate,
+   * MetadataOptionError for an option outside its domain, and
+   * MetadataBindingBudgetError when `filter` and `match` together bind more
+   * SQL parameters than one statement allows.
+   */
+  listMetadata(options?: ListMetadataOptions): Promise<ListMetadataResult>;
 
   /** Get names of collections included by default in queries */
   getDefaultCollectionNames(): Promise<string[]>;
@@ -385,6 +478,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
   // fall through to getDefaultLlamaCpp() (the RemoteLLM). (Note: this YAML nests models
   // under `remote:`, so config.models is undefined here and a local LlamaCpp would
   // silently default to embeddinggemma-300M = 768d.)
+  let ownedLlm: LlamaCpp | undefined;
   if (getActiveBackend() !== "remote") {
     const llm = new LlamaCpp({
       embedModel: config?.models?.embed,
@@ -394,6 +488,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
       disposeModelsOnInactivity: true,
     });
     internal.llm = llm;
+    ownedLlm = llm;
   }
 
   const store: QMDStore = {
@@ -411,11 +506,16 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         ...(opts.collections ?? []),
       ];
       const skipRerank = opts.rerank === false;
+      // The SDK is also a JavaScript boundary: TypeScript declarations do not
+      // protect plain-JS callers or deserialized input. Apply the same bounded,
+      // strict validation used by CLI, MCP, and HTTP before compiling SQL.
+      const filter = opts.filter === undefined ? undefined : parseMetadataFilter(opts.filter);
 
       if (opts.queries) {
         // Pre-expanded queries — use structuredSearch
         return structuredSearch(internal, opts.queries, {
           collections: collections.length > 0 ? collections : undefined,
+          filter,
           limit: opts.limit,
           minScore: opts.minScore,
           explain: opts.explain,
@@ -428,7 +528,8 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
 
       // Simple query string — use hybridQuery (expand + search + rerank)
       return hybridQuery(internal, opts.query!, {
-        collection: collections[0],
+        collection: collections.length > 0 ? collections : undefined,
+        filter,
         limit: opts.limit,
         minScore: opts.minScore,
         explain: opts.explain,
@@ -438,12 +539,18 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         chunkStrategy: opts.chunkStrategy,
       });
     },
-    searchLex: async (q, opts) => internal.searchFTS(q, opts?.limit, opts?.collection),
-    // Mirror getLlm(): prefer the per-store LlamaCpp, else the global default
-    // (the RemoteLLM when a remote backend is active). `llm` above is block-scoped
-    // to the non-remote branch, so resolve the active backend here instead.
-    searchVector: async (q, opts) => internal.searchVec(q, (internal.llm ?? getDefaultLlamaCpp()).embedModelName, opts?.limit, opts?.collection),
-    expandQuery: async (q, opts) => internal.expandQuery(q, undefined, opts?.intent),
+    searchLex: async (q, opts) => {
+      const filter = opts?.filter === undefined ? undefined : parseMetadataFilter(opts.filter);
+      return internal.searchFTS(q, opts?.limit, opts?.collection, filter);
+    },
+    searchVector: async (q, opts) => {
+      const filter = opts?.filter === undefined ? undefined : parseMetadataFilter(opts.filter);
+      // Fork overlay: mirror getLlm() — prefer the per-store LlamaCpp, else the
+      // global default (the RemoteLLM when a remote backend is active). `llm`
+      // above is block-scoped to the non-remote branch.
+      return internal.searchVec(q, (internal.llm ?? getDefaultLlamaCpp()).embedModelName, opts?.limit, opts?.collection, undefined, undefined, filter);
+    },
+    expandQuery: async (q) => internal.expandQuery(q),
     get: async (pathOrDocid, opts) => internal.findDocument(pathOrDocid, opts),
     getDocumentBody: async (pathOrDocid, opts) => {
       const result = internal.findDocument(pathOrDocid, { includeBody: false });
@@ -474,6 +581,11 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
       return result;
     },
     listCollections: async () => storeListCollections(db),
+    listMetadata: async (opts) => storeListMetadata(db, {
+      ...opts,
+      match: opts?.match === undefined ? undefined : parseMetadataMatch(opts.match),
+      filter: opts?.filter === undefined ? undefined : parseMetadataFilter(opts.filter),
+    }),
     getDefaultCollectionNames: async () => {
       const collections = storeListCollections(db);
       return collections.filter(c => c.includeByDefault).map(c => c.name);
@@ -512,7 +624,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
 
       internal.clearCache();
 
-      let totalIndexed = 0, totalUpdated = 0, totalUnchanged = 0, totalRemoved = 0;
+      let totalIndexed = 0, totalUpdated = 0, totalUnchanged = 0, totalRemoved = 0, totalSkipped = 0;
 
       for (const col of filtered) {
         const result = await reindexCollection(internal, col.path, col.pattern || "**/*.md", col.name, {
@@ -525,6 +637,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         totalUpdated += result.updated;
         totalUnchanged += result.unchanged;
         totalRemoved += result.removed;
+        totalSkipped += result.skipped;
       }
 
       return {
@@ -533,6 +646,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         updated: totalUpdated,
         unchanged: totalUnchanged,
         removed: totalRemoved,
+        skipped: totalSkipped,
         needsEmbedding: internal.getHashesNeedingEmbedding(),
       };
     },
@@ -557,7 +671,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
     close: async () => {
       // Only a store-owned LOCAL LlamaCpp is disposed here; when the remote backend is
       // active there is no per-store instance (the shared RemoteLLM is disposed globally).
-      await internal.llm?.dispose();
+      await ownedLlm?.dispose();
       internal.close();
       if (hasYamlConfig || options.config) {
         setConfigSource(undefined); // Reset config source

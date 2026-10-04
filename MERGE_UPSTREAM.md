@@ -26,6 +26,14 @@ Fork-specific code lives in **fork-only files** that upstream doesn't have. This
 |------|---------|
 | `src/cli/qmd.ts` | 2 imports, 7 parseArgs options, `initLLMProvider()` call, Anki command routing + hooks |
 | `.gitignore` | 1 line: `!MERGE_UPSTREAM.md` |
+| `src/index.ts` | `getActiveBackend()` guard around the per-store LlamaCpp (`ownedLlm`), `searchVector` resolves `internal.llm ?? getDefaultLlamaCpp()` |
+| `src/mcp/server.ts` | `initLLMProvider` import + call |
+| `src/collections.ts` | `source?` field + Anki collection normalization in `loadConfig` |
+
+**Watch for silent semantic conflicts.** jj only flags textual overlaps. When both
+sides add overloads or fields to the same interface (e.g. `Database.transaction` in
+`src/db.ts`), the merge applies cleanly but the build breaks. Always run
+`npx tsc -p tsconfig.build.json --noEmit` after merging.
 
 ## Prerequisites
 
