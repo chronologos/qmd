@@ -1,0 +1,56 @@
+[Unit]
+Description=Inkling 2 Mini agent model (vLLM NVFP4, port 8002)
+Documentation=https://recipes.vllm.ai/thinkingmachines/Inkling-2-Mini
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+# Same port and memory slot as the Qwen 35B agent model; run one or the other.
+Conflicts=qwen35b-agent.service
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=10
+# ~20GB of NVFP4 weights plus CUDA graph capture; give startup plenty of room.
+TimeoutStartSec=900
+TimeoutStopSec=120
+
+# Own the container lifecycle entirely: clear any stale instance, then run in the
+# foreground (no -d, with --rm) so systemd tracks the docker client and restarts
+# on exit. Config lives only here — edit this unit, not a detached `docker run`.
+#
+# Image: a pre-release vLLM build; move to a normal release tag once vLLM >= 0.35
+# ships with inkling2_loop support. It is built on CUDA 13.0, which driver 580
+# provides, so unlike qmd-vllm this runs without --enforce-eager (CUDA graph
+# capture confirmed working 2026-11-22 on driver 580.178, kernel 7.0).
+#
+# --gpu-memory-utilization 0.38 (~46 GiB of the 121 GiB unified pool) coexists with
+# qmd-embed (~38 GiB) and qmd-vllm (0.12); do not raise without rebalancing.
+# Measured 2026-11-22: ~30 GiB fixed (weights 24.3, CUDA graphs 2.9, activations
+# and warmup ~3.6) plus 13.4 GiB of KV cache for one 262144-token request, so
+# ~43 GiB is the floor; 0.33 failed at startup, good only to ~180K context.
+# --max-model-len 262144 is the recipe's DGX Spark cap (the model supports 1M).
+# The recipe's --privileged is deliberately left out.
+ExecStartPre=-/usr/bin/docker rm -f inkling-agent
+ExecStart=/usr/bin/docker run --rm --name inkling-agent \
+    --gpus all \
+    --ipc=host \
+    --ulimit memlock=-1 \
+    --ulimit stack=67108864 \
+    -e HF_HUB_OFFLINE=1 \
+    -p 127.0.0.1:8002:8002 \
+    -v /home/iantay/.cache/huggingface:/root/.cache/huggingface \
+    vllm/vllm-openai:inkling-2-mini \
+        thinkingmachines/Inkling-2-Mini \
+        --port 8002 \
+        --tensor-parallel-size 1 \
+        --gpu-memory-utilization 0.38 \
+        --max-model-len 262144 \
+        --reasoning-parser inkling \
+        --tool-call-parser inkling \
+        --enable-auto-tool-choice \
+        --speculative-config '{"method":"dspark","num_speculative_tokens":7,"draft_sample_method":"probabilistic"}'
+ExecStop=/usr/bin/docker stop -t 60 inkling-agent
+
+[Install]
+WantedBy=multi-user.target
